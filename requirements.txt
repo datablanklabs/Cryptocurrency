@@ -1,0 +1,20 @@
+# Core — all already present in this environment.
+pandas>=2.0
+numpy>=1.24
+requests>=2.31
+plotly>=5.18
+ipywidgets>=8.0
+jupyterlab>=4.0
+nbformat>=5.9
+
+# Optional price fallback (used only if Binance/Coinbase/Kraken all fail).
+yfinance>=0.2.40
+
+# Deliberately NOT required:
+#   ccxt        — Binance REST is called directly (broker.py); one less dependency
+#                 between you and the order you're placing.
+#   praw        — Reddit OAuth is ~30 lines (social.py) and avoids praw's
+#                 version churn around Reddit's API changes.
+#   feedparser  — RSS is parsed with the stdlib xml.etree (catalysts.py).
+#   vaderSentiment — generic English sentiment scores crypto slang badly;
+#                 social.py uses a crypto-native lexicon instead.
