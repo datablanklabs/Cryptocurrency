@@ -223,6 +223,80 @@ class BinanceClient:
         # order/test returns {} on success; make that explicit for the caller.
         return result if result else {"test": True, "validated": True, **params}
 
+    # -- protective / resting orders ---------------------------------------
+    def place_stop_limit(self, pair: str, qty: str, stop_price: str,
+                         limit_price: str, side: str = "SELL",
+                         client_id: str | None = None,
+                         trailing_delta: int | None = None) -> dict:
+        """STOP_LOSS_LIMIT.
+
+        Binance.US does not offer market STOP_LOSS - the venue's orderTypes are
+        LIMIT, LIMIT_MAKER, MARKET, STOP_LOSS_LIMIT and TAKE_PROFIT_LIMIT - so a
+        protective stop is necessarily a stop-limit. That carries a real risk
+        worth naming: in a gap or a fast flush the limit may not fill and the
+        stop simply doesn't protect. `stop_limit_offset_bps` sets the limit
+        below the trigger to make a fill likelier.
+        """
+        params: dict[str, Any] = {
+            "symbol": pair, "side": side.upper(), "type": "STOP_LOSS_LIMIT",
+            "quantity": qty, "stopPrice": stop_price, "price": limit_price,
+            "timeInForce": "GTC",
+        }
+        if client_id:
+            params["newClientOrderId"] = client_id[:36]
+        if trailing_delta:
+            params["trailingDelta"] = int(trailing_delta)
+        return self._request("POST", "/api/v3/order", params, signed=True)
+
+    def place_take_profit_limit(self, pair: str, qty: str, stop_price: str,
+                                limit_price: str, side: str = "SELL",
+                                client_id: str | None = None) -> dict:
+        params: dict[str, Any] = {
+            "symbol": pair, "side": side.upper(), "type": "TAKE_PROFIT_LIMIT",
+            "quantity": qty, "stopPrice": stop_price, "price": limit_price,
+            "timeInForce": "GTC",
+        }
+        if client_id:
+            params["newClientOrderId"] = client_id[:36]
+        return self._request("POST", "/api/v3/order", params, signed=True)
+
+    def place_oco(self, pair: str, qty: str, take_profit_price: str,
+                  stop_price: str, stop_limit_price: str, side: str = "SELL",
+                  client_id: str | None = None,
+                  trailing_delta: int | None = None) -> dict:
+        """One-Cancels-Other: take-profit limit + stop-limit as a single order.
+
+        This is the correct primitive when you want both a stop and a target.
+        Two independent resting sells for the same quantity would let both fill
+        (or the second be rejected for insufficient balance) - that is a
+        double-sell hazard, not protection.
+
+        Note there is no /api/v3/order/oco/test endpoint, so an OCO cannot be
+        dry-run validated the way a plain order can. Callers must not send one
+        while in dry-run mode.
+        """
+        params: dict[str, Any] = {
+            "symbol": pair, "side": side.upper(), "quantity": qty,
+            "price": take_profit_price,            # take-profit limit leg
+            "stopPrice": stop_price,               # stop trigger
+            "stopLimitPrice": stop_limit_price,    # stop's limit leg
+            "stopLimitTimeInForce": "GTC",
+        }
+        if client_id:
+            params["listClientOrderId"] = client_id[:36]
+        if trailing_delta:
+            params["trailingDelta"] = int(trailing_delta)
+        # Binance.US exposes the legacy path; /api/v3/orderList/oco is 404 here.
+        return self._request("POST", "/api/v3/order/oco", params, signed=True)
+
+    def open_orders(self, pair: str | None = None) -> list[dict]:
+        params = {"symbol": pair} if pair else {}
+        return self._request("GET", "/api/v3/openOrders", params, signed=True)
+
+    def cancel_open_orders(self, pair: str) -> Any:
+        """Cancel every resting order on a pair, including OCO legs."""
+        return self._request("DELETE", "/api/v3/openOrders", {"symbol": pair}, signed=True)
+
 
 # --------------------------------------------------------------------------
 # Brokers
@@ -253,6 +327,35 @@ class PaperBroker:
             warn.append(f"notional ${proposal['notional']:,.2f} exceeds paper cash "
                         f"${self.store.paper_cash():,.2f}")
         return warn
+
+    def place_protection(self, proposal: dict, record: dict) -> dict | None:
+        """Record simulated protection.
+
+        Nothing rests anywhere in paper mode - there is no venue to hold the
+        order. The row exists so the flow is testable and visible, but the
+        protection it represents is only evaluated when you run the exits pass.
+        Genuine between-run coverage requires a live venue.
+        """
+        ex = self.cfg.execution
+        if not (ex.place_stop_orders or ex.place_limit_orders):
+            return None
+        row = {
+            "symbol": proposal["symbol"], "kind": "simulated",
+            "order_type": "SIMULATED", "exchange_ref": None, "order_list_id": None,
+            "qty": float(record.get("qty") or proposal["qty"]),
+            "stop_price": float(proposal["stop"]), "limit_price": None,
+            "target_price": float(proposal["target"]), "trailing_delta": None,
+            "status": "simulated", "mode": "paper", "venue": "paper",
+            "placed_at": iso(), "response": json.dumps(
+                {"note": "paper mode — no resting order exists at any exchange"}),
+        }
+        self.store.save_protective_order(row)
+        print(f"    · protection simulated (paper): stop {proposal['stop']:,.6g} / "
+              f"target {proposal['target']:,.6g} — evaluated only when you run the exits pass")
+        return row
+
+    def cancel_protection(self, symbol: str) -> int:
+        return self.store.mark_protective_cancelled(symbol)
 
     def execute(self, proposal: dict, run_id: str) -> dict:
         fill = float(proposal["entry"])
@@ -366,6 +469,128 @@ class BinanceBroker:
             if float(proposal["qty"]) > held + 1e-12:
                 warn.append(f"selling {float(proposal['qty']):.6f} but only hold {held:.6f}")
         return warn
+
+    def _trailing_delta(self) -> int | None:
+        """Binance's own trailing delta, in basis points (venue range 10-2000)."""
+        ex = self.cfg.execution
+        if not ex.use_trailing_delta:
+            return None
+        bps = ex.trailing_delta_bps or int(round(self.cfg.exits.trail_pct * 100))
+        return max(10, min(2000, bps))
+
+    def place_protection(self, proposal: dict, record: dict) -> dict | None:
+        """Rest a stop and/or take-profit at Binance after an entry fills.
+
+        This is the part that protects you between notebook runs: the exits pass
+        only sees the market when you run it, whereas an order resting at
+        Binance is watched continuously by Binance.
+        """
+        ex = self.cfg.execution
+        if not (ex.place_stop_orders or ex.place_limit_orders):
+            return None
+        symbol = proposal["symbol"]
+        pair = self.pair(symbol)
+        qty_raw = float(record.get("qty") or proposal["qty"])
+        stop = float(proposal["stop"])
+        target = float(proposal["target"])
+        # Limit sits below the trigger so a fast move still crosses it.
+        stop_limit = stop * (1 - ex.stop_limit_offset_bps / 10_000.0)
+        want_both = ex.place_stop_orders and ex.place_limit_orders
+
+        if want_both and not ex.use_oco:
+            print(f"    ⚠ {symbol}: both stop and target requested with use_oco=False. "
+                  f"Two independent resting sells for the same quantity can double-sell; "
+                  f"placing the STOP only.")
+
+        try:
+            qty_s, stop_s, warn = self.client.normalize_order(pair, qty_raw, stop)
+            _, stop_limit_s, _ = self.client.normalize_order(pair, qty_raw, stop_limit)
+            _, target_s, _ = self.client.normalize_order(pair, qty_raw, target)
+        except BinanceError as exc:
+            print(f"    ✗ {symbol}: cannot size protective order ({exc})")
+            return None
+
+        # OCO has no /test endpoint, so it can never be validated dry-run.
+        if not self.live:
+            row = {
+                "symbol": symbol, "kind": "oco" if want_both and ex.use_oco else "stop",
+                "order_type": "NOT_SENT", "exchange_ref": None, "order_list_id": None,
+                "qty": float(qty_s), "stop_price": float(stop_s),
+                "limit_price": float(stop_limit_s), "target_price": float(target_s),
+                "trailing_delta": self._trailing_delta(), "status": "simulated",
+                "mode": "binance-test", "venue": self.venue, "placed_at": iso(),
+                "response": json.dumps({"note": "not sent — validate-only mode. Binance "
+                                                "offers no test endpoint for OCO."}),
+            }
+            self.store.save_protective_order(row)
+            print(f"    · protection NOT sent ({symbol}): validate-only mode. Would rest "
+                  f"stop {stop_s} (limit {stop_limit_s}) / target {target_s}.")
+            return row
+
+        trailing = self._trailing_delta()
+        cid = f"cyp{uuid.uuid4().hex[:16]}"
+        try:
+            if want_both and ex.use_oco:
+                resp = self.client.place_oco(pair, qty_s, target_s, stop_s,
+                                             stop_limit_s, client_id=cid,
+                                             trailing_delta=trailing)
+                kind, otype = "oco", "OCO"
+                ref = str(resp.get("orderListId") or "")
+            elif ex.place_stop_orders:
+                resp = self.client.place_stop_limit(pair, qty_s, stop_s, stop_limit_s,
+                                                    client_id=cid, trailing_delta=trailing)
+                kind, otype = "stop", "STOP_LOSS_LIMIT"
+                ref = str(resp.get("orderId") or "")
+            else:
+                resp = self.client.place_take_profit_limit(pair, qty_s, target_s,
+                                                           target_s, client_id=cid)
+                kind, otype = "target", "TAKE_PROFIT_LIMIT"
+                ref = str(resp.get("orderId") or "")
+            status = "resting"
+            print(f"    ✓ protection resting on {self.venue}: {otype} {symbol} "
+                  f"qty {qty_s}"
+                  + (f", stop {stop_s} (limit {stop_limit_s})" if kind != "target" else "")
+                  + (f", target {target_s}" if kind in ("oco", "target") else "")
+                  + (f", trailingDelta {trailing}bps" if trailing else ""))
+        except BinanceError as exc:
+            resp, kind, otype, ref, status = {"error": str(exc)}, "stop", "FAILED", "", "failed"
+            print(f"    ✗ {symbol}: protective order rejected — {exc}")
+
+        row = {
+            "symbol": symbol, "kind": kind, "order_type": otype,
+            "exchange_ref": ref, "order_list_id": str(resp.get("orderListId") or "") or None,
+            "qty": float(qty_s), "stop_price": float(stop_s),
+            "limit_price": float(stop_limit_s), "target_price": float(target_s),
+            "trailing_delta": trailing, "status": status, "mode": "binance-live",
+            "venue": self.venue, "placed_at": iso(),
+            "response": json.dumps({"warnings": warn, "response": resp}, default=str),
+        }
+        self.store.save_protective_order(row)
+        return row
+
+    def cancel_protection(self, symbol: str) -> int:
+        """Cancel resting orders before selling.
+
+        A resting sell LOCKS the base asset, so an exit that market-sells
+        without cancelling first fails on insufficient free balance. This is the
+        single most likely way the protective-order feature breaks the exit
+        path, so it runs unconditionally before every SELL.
+        """
+        n = 0
+        if self.live and self.client.configured:
+            try:
+                resting = self.store.resting_orders(symbol)
+                if not resting.empty:
+                    self.client.cancel_open_orders(self.pair(symbol))
+                    print(f"    · cancelled {len(resting)} resting order(s) on {symbol} "
+                          f"to free the balance for this sell")
+            except BinanceError as exc:
+                # -2011 just means there was nothing open; anything else matters.
+                if getattr(exc, "code", None) != -2011:
+                    print(f"    ⚠ {symbol}: could not cancel resting orders ({exc}). "
+                          f"The sell may fail on locked balance.")
+        n = self.store.mark_protective_cancelled(symbol)
+        return n
 
     def execute(self, proposal: dict, run_id: str) -> dict:
         pair = self.pair(proposal["symbol"])

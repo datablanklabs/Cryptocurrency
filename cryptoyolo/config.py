@@ -157,10 +157,71 @@ class RiskConfig:
     # not 0 by default: on a genuinely directionless day the honest output is
     # one candidate, or none, rather than three manufactured ones.
     min_composite_score: float = 0.05
+    # Exits are proposed and executed before entries, so their proceeds are
+    # spendable by the buys in the same run. That projection is discounted by
+    # this much to absorb slippage and fees - the sale rarely nets exactly the
+    # quoted notional, and sizing buys off an optimistic figure is how you end
+    # up with a rejected final order.
+    exit_proceeds_haircut_pct: float = 1.0
+
+
+@dataclass
+class ExitConfig:
+    """When to close an existing position.
+
+    Five independent triggers, each individually switchable. They are evaluated
+    every run against live prices and the position's own recorded entry terms,
+    so an exit no longer depends on the asset happening to rank well on the
+    buy-side scoreboard.
+
+    Precedence when several fire at once is the order listed in exits.TRIGGERS:
+    stop and target are level events that already happened, so they outrank
+    horizon and score-based reasons.
+    """
+    enabled: bool = True
+
+    # 1. Hard stop: price traded through the stop recorded at entry.
+    stop_loss: bool = True
+
+    # 2. Take profit: price reached the target recorded at entry.
+    take_profit: bool = True
+    take_profit_fraction: float = 100.0     # % of the position to sell on a hit
+
+    # 3. Horizon expiry: the 1-7 day thesis has run out of time. A trade held
+    #    past its horizon is no longer the trade that was approved.
+    horizon_expiry: bool = True
+    horizon_days: float = 7.0
+
+    # 4. Trailing stop: give back at most `trail_pct` from the high-water mark,
+    #    but only once the position is `trail_activate_pct` in profit - otherwise
+    #    it is just a tighter stop that fires on entry noise.
+    trailing_stop: bool = True
+    trail_pct: float = 8.0
+    trail_activate_pct: float = 3.0
+
+    # 5. Score reversal: the thesis that opened the position has inverted.
+    score_reversal: bool = True
+    score_reversal_threshold: float = -0.15
+
+    # Exits get their own slots so they never compete with new entries for the
+    # `max_proposals` budget. Set to 0 to disable exit proposals entirely.
+    max_exit_proposals: int = 3
+
+    # Positions with no recorded entry terms (bought outside this dashboard)
+    # can still exit on score reversal, which needs no entry metadata.
+    allow_exits_without_metadata: bool = True
 
 
 @dataclass
 class RedditConfig:
+    # Data sources, tried in order until one returns rows. Reddit's anonymous
+    # .json endpoints are 403 from most hosts, so without credentials the
+    # keyless fallbacks are what actually work:
+    #   oauth       official API (needs a free script app) - best quality
+    #   arctic      Arctic Shift, a public Pushshift successor - has scores
+    #   rss         Reddit's own Atom feeds - works keyless, but NO scores
+    #   public_json legacy anonymous .json - usually 403, kept as a last resort
+    sources: tuple[str, ...] = ("oauth", "arctic", "rss", "public_json")
     subreddits: tuple[str, ...] = ("wallstreetbets", "cryptocurrency")
     listings: tuple[str, ...] = ("new", "hot")
     posts_per_listing: int = 100
@@ -208,7 +269,35 @@ class ExecutionConfig:
     order_type: str = "MARKET"          # "MARKET" | "LIMIT"
     limit_offset_bps: float = 5.0       # for LIMIT: how far through the mid to place
     recv_window_ms: int = 5_000
-    place_stop_orders: bool = False     # also submit an OCO/stop-loss after entry
+
+    # ---- Protective orders resting on the exchange after an entry fills ----
+    # These are what give protection *between* notebook runs. The exits pass
+    # only sees the market when you run it; an order resting at Binance is
+    # watched by Binance continuously.
+    #
+    # Binance.US supports LIMIT, LIMIT_MAKER, MARKET, STOP_LOSS_LIMIT and
+    # TAKE_PROFIT_LIMIT. It does NOT support market STOP_LOSS, so a protective
+    # stop is always a stop-LIMIT: `stop_limit_offset_bps` sets how far through
+    # the trigger the limit sits, since a limit exactly at the stop may not fill
+    # in a fast move.
+    place_stop_orders: bool = False        # rest a protective stop after entry
+    place_limit_orders: bool = False       # rest a take-profit limit at the target
+    place_stop_limit_orders: bool = True   # stop leg uses STOP_LOSS_LIMIT (required here)
+    stop_limit_offset_bps: float = 25.0
+
+    # When both a stop and a target are wanted, send them as one OCO so that
+    # filling one cancels the other. Two independent resting sells for the same
+    # quantity is a double-sell hazard, not protection.
+    use_oco: bool = True
+
+    # Binance can trail the stop itself via trailingDelta (10-2000 bps).
+    # 0 = derive from CONFIG.exits.trail_pct.
+    use_trailing_delta: bool = False
+    trailing_delta_bps: int = 0
+
+    # Binance caps resting algo (stop/OCO) orders per symbol; see the
+    # MAX_NUM_ALGO_ORDERS filter, currently 5 on BTCUSDT.
+    max_algo_orders_per_symbol: int = 5
 
     BASE_URLS = {
         "binance-us": "https://api.binance.us",
@@ -236,6 +325,7 @@ class Config:
     bands: BandConfig = field(default_factory=BandConfig)
     weights: ScoreWeights = field(default_factory=ScoreWeights)
     risk: RiskConfig = field(default_factory=RiskConfig)
+    exits: ExitConfig = field(default_factory=ExitConfig)
     reddit: RedditConfig = field(default_factory=RedditConfig)
     catalysts: CatalystConfig = field(default_factory=CatalystConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)

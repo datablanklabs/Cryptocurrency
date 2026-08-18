@@ -18,7 +18,7 @@ import pandas as pd
 from .broker import execution_banner
 from .config import CONFIG, Config
 from .engine import fmt_price, fmt_qty
-from .store import Store
+from .store import Store, iso
 
 APPROVE = {"y", "yes", "a", "approve"}
 REJECT = {"n", "no", "r", "reject", ""}
@@ -69,17 +69,27 @@ def request_approval(proposals: pd.DataFrame, cfg: Config = CONFIG,
             decisions.append("rejected")
             continue
 
-        move_pct = (p["target"] - p["entry"]) / p["entry"] * 100
-        stop_pct = (p["stop"] - p["entry"]) / p["entry"] * 100
+        is_exit = p.get("kind") == "exit"
         print(f"\n{'─' * 78}")
-        print(f"#{p['rank']}  {p['side']} {p['symbol']}   composite {p['composite']:+.3f}"
-              f"   horizon {p['horizon']}")
-        print(f"{'─' * 78}")
-        print(f"  entry   {fmt_price(p['entry']):>18}")
-        print(f"  stop    {fmt_price(p['stop']):>18}   ({stop_pct:+.2f}%)")
-        print(f"  target  {fmt_price(p['target']):>18}   ({move_pct:+.2f}%)   R:R {p['reward_risk']:.2f}")
-        print(f"  size    {fmt_qty(p['qty']):>18} {p['symbol']}   ≈ ${p['notional']:,.2f}"
-              f"   risk ≈ ${p['risk_usd']:,.2f}")
+        if is_exit:
+            print(f"#{p['rank']}  ⟵ EXIT {p['symbol']}   [{p['trigger']}]   "
+                  f"horizon {p['horizon']}")
+            print(f"{'─' * 78}")
+            print(f"  price   {fmt_price(p['entry']):>18}")
+            print(f"  size    {fmt_qty(p['qty']):>18} {p['symbol']}   "
+                  f"≈ ${p['notional']:,.2f}")
+        else:
+            move_pct = (p["target"] - p["entry"]) / p["entry"] * 100
+            stop_pct = (p["stop"] - p["entry"]) / p["entry"] * 100
+            print(f"#{p['rank']}  {p['side']} {p['symbol']}   "
+                  f"composite {p['composite']:+.3f}   horizon {p['horizon']}")
+            print(f"{'─' * 78}")
+            print(f"  entry   {fmt_price(p['entry']):>18}")
+            print(f"  stop    {fmt_price(p['stop']):>18}   ({stop_pct:+.2f}%)")
+            print(f"  target  {fmt_price(p['target']):>18}   ({move_pct:+.2f}%)   "
+                  f"R:R {p['reward_risk']:.2f}")
+            print(f"  size    {fmt_qty(p['qty']):>18} {p['symbol']}   ≈ ${p['notional']:,.2f}"
+                  f"   risk ≈ ${p['risk_usd']:,.2f}")
         print(f"\n  {p['rationale']}")
 
         warns = (preflight or {}).get(p["proposal_id"], [])
@@ -126,6 +136,42 @@ def request_approval(proposals: pd.DataFrame, cfg: Config = CONFIG,
     return out
 
 
+def _sync_position_meta(proposal, record: dict, broker, store: Store,
+                        cfg: Config = CONFIG) -> None:
+    """Give a filled position the memory its exits depend on.
+
+    A BUY records where the stop, target and clock were set at entry - without
+    this, level- and time-based exits have nothing to evaluate against later. A
+    SELL that flattens the position clears the row so a future re-entry starts
+    a fresh clock and high-water mark rather than inheriting stale terms.
+    """
+    if record.get("status") in {"REJECTED", "REJECTED_INSUFFICIENT_CASH"}:
+        return
+    symbol = record["symbol"]
+
+    if record["side"].upper() == "BUY":
+        fill = float(record.get("price") or proposal["entry"])
+        store.upsert_position_meta({
+            "symbol": symbol,
+            "opened_at": iso(),
+            "entry_price": fill,
+            "stop": float(proposal["stop"]),
+            "target": float(proposal["target"]),
+            "horizon_days": float(cfg.exits.horizon_days),
+            "high_water": fill,
+            "proposal_id": proposal["proposal_id"],
+            "mode": record.get("mode", cfg.execution.mode),
+        })
+        return
+
+    try:
+        remaining = float(broker.holdings().get(symbol, 0.0))
+    except Exception:  # noqa: BLE001 - keep the row rather than lose the terms
+        return
+    if remaining <= 1e-9:
+        store.delete_position_meta(symbol)
+
+
 def execute_approved(proposals: pd.DataFrame, broker, store: Store, run_id: str,
                      cfg: Config = CONFIG) -> pd.DataFrame:
     """Execute every proposal marked approved. Records all outcomes."""
@@ -137,18 +183,33 @@ def execute_approved(proposals: pd.DataFrame, broker, store: Store, run_id: str,
         store.set_decision(p["proposal_id"], p["decision"])
         if p["decision"] != "approved":
             continue
+        # Resting protective orders lock the base asset, so they must be
+        # cancelled BEFORE a sell or the order fails on free balance.
+        if p["side"].upper() == "SELL" and hasattr(broker, "cancel_protection"):
+            broker.cancel_protection(p["symbol"])
+
         record = broker.execute(p.to_dict(), run_id)
+        _sync_position_meta(p, record, broker, store, cfg)
+
+        mark = "✓" if record["status"] not in {"REJECTED"} else "✗"
+        print(f"  {mark} {record['side']:<4} {record['symbol']:<6} "
+              f"qty={record['qty']:<14.6f} @ {record['price']:<12,.4f} "
+              f"[{record['status']} · {record['mode']}]")
+
+        if (p["side"].upper() == "BUY"
+                and record.get("status") not in {"REJECTED", "REJECTED_INSUFFICIENT_CASH"}
+                and hasattr(broker, "place_protection")):
+            try:
+                broker.place_protection(p.to_dict(), record)
+            except Exception as exc:  # noqa: BLE001 - entry stands, protection didn't
+                print(f"    ⚠ {p['symbol']}: entry filled but protective order failed "
+                      f"({exc}). Position is UNPROTECTED between runs.")
         results.append({
             "symbol": record["symbol"], "side": record["side"],
             "qty": record["qty"], "price": record["price"],
             "status": record["status"], "mode": record["mode"],
             "venue": record["venue"], "order_id": record["order_id"],
         })
-        mark = "✓" if record["status"] not in {"REJECTED"} else "✗"
-        print(f"  {mark} {record['side']:<4} {record['symbol']:<6} "
-              f"qty={record['qty']:<14.6f} @ {record['price']:<12,.4f} "
-              f"[{record['status']} · {record['mode']}]")
-
     if not results:
         print("  Nothing approved — no orders sent.")
     return pd.DataFrame(results)

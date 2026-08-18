@@ -111,14 +111,23 @@ def technical_score(short: dict[str, float], medium: dict[str, float]) -> tuple[
 # --------------------------------------------------------------------------
 # Assembly
 # --------------------------------------------------------------------------
-def build_scores(store: Store, cfg: Config = CONFIG, verbose: bool = True) -> pd.DataFrame:
-    """Compute technical/social/catalyst/composite scores for the universe."""
+def build_scores(store: Store, cfg: Config = CONFIG, verbose: bool = True,
+                 extra_symbols: list[str] | None = None) -> pd.DataFrame:
+    """Compute technical/social/catalyst/composite scores.
+
+    `extra_symbols` covers assets you hold that are not in the configured
+    universe. Without it those positions are never scored, so no exit signal can
+    ever be produced for them - they would be silently unsellable by the engine.
+    """
     social_df = social_mod.score_symbols(store, cfg).set_index("symbol")
     catalyst_df = catalysts_mod.score_symbols(store, cfg).set_index("symbol")
     weights = cfg.weights.normalized()
 
+    universe = set(cfg.symbols)
+    targets = list(cfg.symbols) + [s for s in (extra_symbols or []) if s not in universe]
+
     rows: list[dict[str, Any]] = []
-    for symbol in cfg.symbols:
+    for symbol in targets:
         try:
             short_raw, _ = prices.get_ohlcv(symbol, "1d", cfg)
             med_raw, _ = prices.get_ohlcv(symbol, "1w", cfg)
@@ -153,6 +162,7 @@ def build_scores(store: Store, cfg: Config = CONFIG, verbose: bool = True) -> pd
 
         rows.append({
             "symbol": symbol,
+            "held_only": symbol not in universe,
             "technical": round(tech, 4),
             "social": round(soc, 4),
             "catalyst": round(cat, 4),
@@ -231,13 +241,20 @@ def _rationale(row: pd.Series, side: str, cfg: Config) -> str:
 # --------------------------------------------------------------------------
 def propose(scores: pd.DataFrame, store: Store, run_id: str, cfg: Config = CONFIG,
             holdings: dict[str, float] | None = None,
-            cash_available: float | None = None) -> pd.DataFrame:
+            cash_available: float | None = None,
+            exit_signals: pd.DataFrame | None = None) -> pd.DataFrame:
     """Turn scores into at most `cfg.risk.max_proposals` sized trade candidates.
 
     Sizing is risk-first: the stop distance comes from ATR, and quantity is set
     so that being stopped out costs `risk_per_trade_pct` of equity - never a
     fixed dollar amount per trade, which silently takes far more risk on
     volatile names.
+
+    `exit_signals` (from exits.evaluate) are emitted first, into their own
+    reserved slots, and are NOT subject to `min_composite_score` - a stop that
+    has already been hit is a fact about the position, not an opinion about its
+    ranking. Entries then fill the remaining `max_proposals` budget, so exits and
+    entries never compete for the same slots.
 
     `cash_available` is the real spendable balance (paper cash, or the free
     quote-asset balance on Binance). Total BUY notional is capped to it, so the
@@ -255,11 +272,72 @@ def propose(scores: pd.DataFrame, store: Store, run_id: str, cfg: Config = CONFI
         return pd.DataFrame()
 
     candidates: list[dict[str, Any]] = []
+    exiting: set[str] = set()
+    # Every symbol under an exit signal, whether or not the exit itself makes it
+    # into a slot. A dust-sized position can fail the minimum-notional check and
+    # so produce no sellable ticket - but it must still never come back as a BUY
+    # in the same run. Proposing an entry on something the exit logic just voted
+    # to close is incoherent, and the earlier version did exactly that.
+    flagged_for_exit: set[str] = set()
+    if exit_signals is not None and not exit_signals.empty:
+        flagged_for_exit = set(exit_signals["symbol"])
+
+    # ---- exits first, in their own slots -------------------------------
+    if exit_signals is not None and not exit_signals.empty and cfg.exits.max_exit_proposals > 0:
+        by_symbol = {r["symbol"]: r for _, r in scores.iterrows()} if not scores.empty else {}
+        for _, sig in exit_signals.head(cfg.exits.max_exit_proposals).iterrows():
+            symbol = sig["symbol"]
+            qty = min(float(sig["qty"]), float(holdings.get(symbol, 0.0)))
+            last = sig.get("last")
+            row = by_symbol.get(symbol)
+            price = float(last) if last else (float(row["price"]) if row is not None else 0.0)
+            if qty <= 0 or price <= 0:
+                continue
+            notional = qty * price
+            if notional < risk.min_notional_usd:
+                print(f"  [exit] {symbol}: {sig['trigger_label']} fired but the position "
+                      f"is worth ${notional:,.2f}, under the ${risk.min_notional_usd:,.2f} "
+                      f"minimum — cannot be sold. Left open; excluded from new entries.")
+                continue
+            exiting.add(symbol)
+            candidates.append({
+                "symbol": symbol, "side": "SELL",
+                "composite": float(sig["composite"]) if pd.notna(sig.get("composite")) else 0.0,
+                "entry": price,
+                # An exit already met its condition; the stop/target on the
+                # ticket are the levels that fired, not new ones to defend.
+                "stop": float(sig["stop"]) if pd.notna(sig.get("stop")) else price,
+                "target": float(sig["target"]) if pd.notna(sig.get("target")) else price,
+                "qty": qty, "notional": notional, "risk_usd": 0.0,
+                "row": row, "exit_signal": sig,
+            })
+
+    # ---- capital released by the exits ---------------------------------
+    # Exits are ranked first AND executed first, so their proceeds are actually
+    # spendable by the entries in this same run. Sizing buys off the pre-sale
+    # balance would leave capital idle for no reason. The haircut absorbs
+    # slippage and fees; if a sell is then rejected at the approval prompt, the
+    # execution-time cash check still blocks the buy it was funding.
+    exit_proceeds = 0.0
+    if cash_available is not None:
+        gross = sum(c["notional"] for c in candidates if c["side"] == "SELL")
+        exit_proceeds = gross * (1.0 - risk.exit_proceeds_haircut_pct / 100.0)
+        if gross > 0:
+            print(f"  [capital] {len(exiting)} exit(s) release ≈${exit_proceeds:,.2f} "
+                  f"(${gross:,.2f} less {risk.exit_proceeds_haircut_pct:.1f}% haircut); "
+                  f"buying power ${cash_available:,.2f} → ${cash_available + exit_proceeds:,.2f}")
+    buying_power = None if cash_available is None else cash_available + exit_proceeds
+
+    # ---- then entries, from the score ranking ---------------------------
     ranked = scores.sort_values("composite", key=abs, ascending=False)
 
     for _, row in ranked.iterrows():
+        if len(candidates) - len(exiting) >= risk.max_proposals:
+            break
         composite = float(row["composite"])
         symbol = row["symbol"]
+        if symbol in flagged_for_exit:
+            continue            # closing (or flagged to close) — never re-enter
         if abs(composite) < risk.min_composite_score:
             continue
 
@@ -290,9 +368,10 @@ def propose(scores: pd.DataFrame, store: Store, run_id: str, cfg: Config = CONFI
         qty = risk_budget / stop_dist if stop_dist > 0 else 0.0
 
         max_notional = risk.account_equity_usd * (risk.max_position_pct / 100.0)
-        if side == "BUY" and cash_available is not None:
-            # No single purchase may exceed what's actually spendable.
-            max_notional = min(max_notional, cash_available)
+        if side == "BUY" and buying_power is not None:
+            # No single purchase may exceed what will actually be spendable
+            # once this run's exits have settled.
+            max_notional = min(max_notional, buying_power)
         if qty * entry > max_notional:
             qty = max_notional / entry
 
@@ -308,10 +387,8 @@ def propose(scores: pd.DataFrame, store: Store, run_id: str, cfg: Config = CONFI
             "entry": entry, "stop": stop, "target": target,
             "qty": qty, "notional": notional,
             "risk_usd": min(risk_budget, notional),
-            "row": row,
+            "row": row, "exit_signal": None,
         })
-        if len(candidates) >= risk.max_proposals:
-            break
 
     if not candidates:
         return pd.DataFrame()
@@ -324,8 +401,8 @@ def propose(scores: pd.DataFrame, store: Store, run_id: str, cfg: Config = CONFI
     buys = [c for c in candidates if c["side"] == "BUY"]
     buy_total = sum(c["notional"] for c in buys)
     limits = [("deployment", risk.account_equity_usd * (risk.max_total_deployed_pct / 100.0))]
-    if cash_available is not None:
-        limits.append(("cash", float(cash_available)))
+    if buying_power is not None:
+        limits.append(("cash", float(buying_power)))
 
     binding, cap = min(limits, key=lambda kv: kv[1])
     if buy_total > cap > 0:
@@ -345,17 +422,31 @@ def propose(scores: pd.DataFrame, store: Store, run_id: str, cfg: Config = CONFI
     if not candidates:
         return pd.DataFrame()
 
+    from . import exits as exits_mod
+
     ts = iso()
     out: list[dict[str, Any]] = []
     for rank, c in enumerate(candidates, start=1):
         row = c["row"]
+        sig = c.get("exit_signal")
+        is_exit = sig is not None
         rr = abs(c["target"] - c["entry"]) / max(abs(c["entry"] - c["stop"]), 1e-9)
-        payload = {
-            "components": row["components"],
-            "scores": {"technical": row["technical"], "social": row["social"],
-                       "catalyst": row["catalyst"], "composite": row["composite"]},
-            "weights": cfg.weights.normalized().__dict__,
-        }
+
+        if row is not None:
+            payload = {
+                "components": row["components"],
+                "scores": {"technical": row["technical"], "social": row["social"],
+                           "catalyst": row["catalyst"], "composite": row["composite"]},
+                "weights": cfg.weights.normalized().__dict__,
+            }
+        else:
+            # Held asset with no score row (e.g. price fetch failed). The exit
+            # still stands - it fired on recorded entry terms, not on a score.
+            payload = {"components": {}, "scores": {}, "note": "no score row"}
+        if is_exit:
+            payload["exit"] = {k: (None if pd.isna(v) else v)
+                               for k, v in sig.to_dict().items()}
+
         out.append({
             "proposal_id": f"{run_id}-{rank}-{uuid.uuid4().hex[:6]}",
             "run_id": run_id, "ts": ts, "symbol": c["symbol"], "side": c["side"],
@@ -363,15 +454,20 @@ def propose(scores: pd.DataFrame, store: Store, run_id: str, cfg: Config = CONFI
             "entry": round(c["entry"], 8), "stop": round(c["stop"], 8),
             "target": round(c["target"], 8),
             "qty": float(c["qty"]), "notional": round(c["notional"], 2),
-            "risk_usd": round(c["risk_usd"], 2), "reward_risk": round(rr, 2),
-            "horizon": "1-7 days",
-            "rationale": _rationale(row, c["side"], cfg),
+            "risk_usd": round(c["risk_usd"], 2),
+            "reward_risk": 0.0 if is_exit else round(rr, 2),
+            "kind": "exit" if is_exit else "entry",
+            "trigger": sig["trigger_label"] if is_exit else "",
+            "horizon": "close now" if is_exit else "1-7 days",
+            "rationale": (exits_mod.describe(sig, cfg) if is_exit
+                          else _rationale(row, c["side"], cfg)),
             "payload": json.dumps(payload, default=str),
             "decision": "pending",
         })
 
     df = pd.DataFrame(out)
-    store.save_proposals(df.drop(columns=["risk_usd", "reward_risk"]).to_dict("records"))
+    store.save_proposals(
+        df.drop(columns=["risk_usd", "reward_risk", "kind", "trigger"]).to_dict("records"))
     return df
 
 
@@ -409,18 +505,28 @@ def format_proposals(proposals: pd.DataFrame) -> str:
                 "manufacture three trades every run.")
     lines: list[str] = []
     for _, p in proposals.iterrows():
-        move_pct = (p["target"] - p["entry"]) / p["entry"] * 100
-        stop_pct = (p["stop"] - p["entry"]) / p["entry"] * 100
-        lines.append(
-            f"\n{'─' * 78}\n"
-            f"#{p['rank']}  {p['side']} {p['symbol']}   composite {p['composite']:+.3f}   "
-            f"horizon {p['horizon']}\n"
-            f"{'─' * 78}\n"
-            f"  entry   {fmt_price(p['entry']):>16}\n"
-            f"  stop    {fmt_price(p['stop']):>16}   ({stop_pct:+.2f}%)\n"
-            f"  target  {fmt_price(p['target']):>16}   ({move_pct:+.2f}%)   R:R {p['reward_risk']:.2f}\n"
-            f"  size    {fmt_qty(p['qty']):>16} {p['symbol']}  ≈ ${p['notional']:,.2f}   "
-            f"risk ≈ ${p['risk_usd']:,.2f}\n"
-            f"\n  {p['rationale']}\n"
-        )
+        is_exit = p.get("kind") == "exit"
+        header = (f"#{p['rank']}  ⟵ EXIT {p['symbol']}   [{p['trigger']}]"
+                  if is_exit else
+                  f"#{p['rank']}  {p['side']} {p['symbol']}   "
+                  f"composite {p['composite']:+.3f}")
+        lines.append(f"\n{'─' * 78}\n{header}   horizon {p['horizon']}\n{'─' * 78}\n")
+        if is_exit:
+            lines.append(
+                f"  price   {fmt_price(p['entry']):>16}\n"
+                f"  size    {fmt_qty(p['qty']):>16} {p['symbol']}  "
+                f"≈ ${p['notional']:,.2f}\n"
+            )
+        else:
+            move_pct = (p["target"] - p["entry"]) / p["entry"] * 100
+            stop_pct = (p["stop"] - p["entry"]) / p["entry"] * 100
+            lines.append(
+                f"  entry   {fmt_price(p['entry']):>16}\n"
+                f"  stop    {fmt_price(p['stop']):>16}   ({stop_pct:+.2f}%)\n"
+                f"  target  {fmt_price(p['target']):>16}   ({move_pct:+.2f}%)   "
+                f"R:R {p['reward_risk']:.2f}\n"
+                f"  size    {fmt_qty(p['qty']):>16} {p['symbol']}  ≈ ${p['notional']:,.2f}   "
+                f"risk ≈ ${p['risk_usd']:,.2f}\n"
+            )
+        lines.append(f"\n  {p['rationale']}\n")
     return "".join(lines)
