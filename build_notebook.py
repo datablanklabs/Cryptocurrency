@@ -74,9 +74,22 @@ from pathlib import Path
 
 import pandas as pd
 import plotly.io as pio
+from IPython.display import clear_output, display
 
 sys.path.insert(0, str(Path.cwd()))
 warnings.filterwarnings("ignore")
+
+# Drop any previously-imported cryptoyolo modules before importing.
+#
+# Python caches modules in sys.modules, so if the package changed on disk after
+# this kernel first imported it, re-running this cell would silently keep the
+# OLD code — and you'd get confusing failures like
+# "'Config' object has no attribute 'exits'" from a config cell that looks
+# correct. Purging here means re-running Setup always picks up the current
+# source, no kernel restart needed.
+for _stale in [m for m in list(sys.modules)
+               if m == "cryptoyolo" or m.startswith("cryptoyolo.")]:
+    del sys.modules[_stale]
 pd.set_option("display.width", 200)
 pd.set_option("display.max_columns", 50)
 pio.renderers.default = "notebook"
@@ -89,6 +102,18 @@ from cryptoyolo.store import Store
 
 load_dotenv()                      # reads ./.env if present; never overwrites real env vars
 store = Store(CONFIG.db_path)
+
+# Fail loudly and legibly if the loaded code is still older than this notebook,
+# rather than letting a later cell die on a missing attribute.
+_required = {"exits": "exit management", "risk": "risk sizing",
+             "execution": "order execution"}
+_missing = [f"CONFIG.{a} ({why})" for a, why in _required.items()
+            if not hasattr(CONFIG, a)]
+if _missing:
+    raise RuntimeError(
+        "Loaded cryptoyolo is out of date — missing: " + ", ".join(_missing)
+        + ".\nRestart the kernel (Kernel → Restart Kernel and Run All Cells)."
+    )
 
 print(f"database   : {CONFIG.db_path}")
 print(f"universe   : {len(CONFIG.symbols)} assets")
@@ -103,13 +128,15 @@ Nothing is hard-coded. Create a `.env` next to this notebook (see `.env.example`
 
 | Variable | Needed for | Without it |
 |---|---|---|
-| `REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET` | Feature 2 | **Reddit returns 403** — social score is flat 0 |
+| `REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET` | Feature 2 | falls back to keyless sources — still works |
 | `BINANCE_API_KEY` / `BINANCE_API_SECRET` | Execution | paper mode still works fully |
 | `GITHUB_TOKEN` | Feature 3 | works, but 60 req/hr caps the universe scan |
 | `CRYPTO_YOLO_ALLOW_LIVE=1` | Live orders | orders stay validate-only |
 
-Reddit credentials are free: <https://www.reddit.com/prefs/apps> → *create app* →
-type **script** → copy the id under the app name and the secret.
+Reddit credentials are **optional** — the scraper falls back to Arctic Shift (a
+public Pushshift successor) and Reddit's own Atom feeds when they're absent. They
+are free if you want the better feed: <https://www.reddit.com/prefs/apps> →
+*create app* → type **script** → copy the id under the app name and the secret.
 """),
 
 md("## Configuration"),
@@ -128,6 +155,23 @@ CONFIG.risk.atr_stop_mult        = 1.5        # stop = 1.5 x daily ATR(14)
 CONFIG.risk.reward_risk_target   = 2.0        # target = 2R
 CONFIG.risk.max_proposals        = 3
 CONFIG.risk.min_composite_score  = 0.05       # 0.0 = always fill all 3 slots
+
+# ── Exits: when to close an existing position ───────────────────────────
+# Five independent triggers, each switchable. Evaluated every run against live
+# prices and the terms recorded when the position was opened — so an exit no
+# longer depends on the asset happening to rank well on the buy-side scoreboard.
+CONFIG.exits.enabled                  = True
+CONFIG.exits.stop_loss                = True    # price through the stop set at entry
+CONFIG.exits.take_profit              = True    # price reached the target
+CONFIG.exits.take_profit_fraction     = 100.0   # % of position to sell on a target hit
+CONFIG.exits.trailing_stop            = True
+CONFIG.exits.trail_pct                = 8.0     # max giveback from the high-water mark
+CONFIG.exits.trail_activate_pct       = 3.0     # only arm once this far in profit
+CONFIG.exits.horizon_expiry           = True    # the 1–7d thesis ran out of time
+CONFIG.exits.horizon_days             = 7.0
+CONFIG.exits.score_reversal           = True    # the thesis inverted
+CONFIG.exits.score_reversal_threshold = -0.15
+CONFIG.exits.max_exit_proposals       = 3       # exits get their OWN slots
 
 # ── Score weights (must be defensible to you, not to me) ────────────────
 CONFIG.weights.technical = 0.50
@@ -154,12 +198,159 @@ CONFIG.execution.dry_run     = True
 CONFIG.execution.order_type  = "MARKET"
 CONFIG.execution.quote_asset = "USDT"
 
+# ── Protective resting orders (continuous, venue-side protection) ────────
+# The exits pass only sees the market when you run the notebook. An order
+# resting AT Binance is watched by Binance continuously — that is the only way
+# an overnight stop breach gets acted on at the time it happens.
+# Binance.US supports STOP_LOSS_LIMIT and TAKE_PROFIT_LIMIT but NOT market
+# STOP_LOSS, so a protective stop is always a stop-LIMIT.
+CONFIG.execution.place_stop_orders       = False   # rest a protective stop after entry
+CONFIG.execution.place_limit_orders      = False   # rest a take-profit at the target
+CONFIG.execution.place_stop_limit_orders = True    # stop leg is STOP_LOSS_LIMIT (required)
+CONFIG.execution.use_oco                 = True    # send both as one OCO (see below)
+CONFIG.execution.stop_limit_offset_bps   = 25.0    # limit sits this far through the trigger
+CONFIG.execution.use_trailing_delta      = False   # let Binance trail the stop itself
+CONFIG.execution.trailing_delta_bps      = 0       # 0 = derive from CONFIG.exits.trail_pct
+
 w = CONFIG.weights.normalized()
 print(f"weights    : technical {w.technical:.0%} · social {w.social:.0%} · catalyst {w.catalyst:.0%}")
 print(f"risk/trade : ${CONFIG.risk.account_equity_usd * CONFIG.risk.risk_per_trade_pct / 100:,.2f}")
 
 from cryptoyolo.broker import execution_banner
 print(f"execution  : {execution_banner(CONFIG)}")
+"""),
+
+md(r"""
+---
+## Feature 0 · Account balance & holdings
+
+What you actually own right now. Everything downstream depends on it — position
+sizing, the cash cap on purchases, and whether a SELL is even possible (spot
+can't short, so exits only exist for assets you hold).
+
+Balance comes from paper cash in paper mode, and from your **free** quote-asset
+balance on Binance otherwise. Cost basis is exact in paper mode; on a live
+account only fills placed *through this dashboard* have a basis we can honestly
+report, so anything bought elsewhere shows `—` rather than a guess.
+"""),
+
+code(r"""
+from cryptoyolo import portfolio
+
+snap = portfolio.snapshot(store, CONFIG)
+print(portfolio.format_summary(snap))
+"""),
+
+code(r"""
+# Same data as a frame, for sorting/filtering or feeding a chart.
+positions = snap["positions"]
+if positions.empty:
+    print(f"No open positions. Cash: "
+          + (f"${snap['cash']:,.2f}" if snap["cash"] is not None else "unavailable"))
+else:
+    display(positions.style.format({
+        "qty": "{:,.6f}", "avg_cost": "{:,.6f}", "last": "{:,.6f}",
+        "value": "${:,.2f}", "pnl": "${:+,.2f}", "pnl_pct": "{:+.2f}%",
+        "weight_pct": "{:.1f}%",
+    }, na_rep="—").hide(axis="index"))
+"""),
+
+md(r"""
+### Exit rules in force
+
+Exits are evaluated **before** the buy-side ranking, against each position's own
+recorded entry terms — not against how attractive the asset looks today. That
+separation is the point: a position drifting below its stop would otherwise only
+surface if it out-ranked every buy candidate, which it rarely does.
+
+When several fire at once, precedence is the order below. Stop and target come
+first because they are level events that have *already happened* — the position
+is at a price you previously said you would act on. Horizon and score reversal
+are judgement calls and yield to them.
+
+Positions opened outside this dashboard have no recorded stop, target or open
+date. Rather than invent them, only score-reversal applies, and the exit says so.
+"""),
+
+code(r"""
+from cryptoyolo import exits
+
+display(exits.active_triggers(CONFIG).style.hide(axis="index"))
+
+signals = exits.evaluate(store, CONFIG, snap["positions"].set_index("symbol")["qty"].to_dict()
+                         if not snap["positions"].empty else {})
+if signals.empty:
+    print("\nNo exit trigger fired on current positions.")
+else:
+    print(f"\n{len(signals)} exit signal(s):\n")
+    for _, sig in signals.iterrows():
+        print(f"  {sig['symbol']:<6} [{sig['trigger_label']}] {sig['reason']}")
+"""),
+
+md(r"""
+Sizing uses `CONFIG.risk.account_equity_usd` as the **risk basis** — how much
+you're willing to lose per trade — which is deliberately separate from your
+balance. If the two drift far apart the summary above says so. To sync it to
+real equity:
+
+```python
+if snap["total_equity"]:
+    CONFIG.risk.account_equity_usd = snap["total_equity"]
+```
+
+Purchases are capped at actual cash regardless, so leaving them out of sync
+can't cause an overdraft — it only makes position sizes larger or smaller than
+you probably intend.
+"""),
+
+md(r"""
+### Continuous protection between runs
+
+Everything in the exits section runs **only when you run the notebook**. A stop
+breached at 3am is acted on at your next run, not when it happened. Closing that
+gap needs an order resting at the venue, which is what
+`place_stop_orders` / `place_limit_orders` do.
+
+**Binance.US has no market `STOP_LOSS`** — its order types are `LIMIT`,
+`LIMIT_MAKER`, `MARKET`, `STOP_LOSS_LIMIT` and `TAKE_PROFIT_LIMIT`. A protective
+stop is therefore always a stop-*limit*, and that carries a real risk worth
+naming: **in a gap or a fast flush the limit may not fill and the stop simply
+does not protect you.** `stop_limit_offset_bps` places the limit below the
+trigger to make a fill likelier; it cannot guarantee one.
+
+**Both legs go as one OCO.** Two independent resting sells for the same quantity
+would let both fill, or the second be rejected for insufficient balance — a
+double-sell hazard, not protection. With `use_oco=False` and both flags on, only
+the stop is placed and the notebook says so.
+
+**Resting sells lock the asset.** An exit that tries to market-sell while a stop
+rests would fail on free balance, so protection is cancelled automatically
+before every SELL.
+
+Two limits to keep in mind. Only *stop* and *target* can be delegated to the
+venue — horizon expiry and score reversal are judgements this code makes, so
+they still need a run. And protection is only real in **live** mode: paper and
+validate-only record what would rest but place nothing (Binance offers no test
+endpoint for OCO, so it cannot be dry-run validated at all).
+"""),
+
+code(r"""
+ex = CONFIG.execution
+print(f"protective orders : stop={ex.place_stop_orders}  target={ex.place_limit_orders}"
+      f"  oco={ex.use_oco}  trailing_delta={ex.use_trailing_delta}")
+print(f"stop leg type     : {'STOP_LOSS_LIMIT' if ex.place_stop_limit_orders else 'STOP_LOSS (unsupported on binance-us)'}")
+print(f"limit offset      : {ex.stop_limit_offset_bps:.0f} bps through the trigger")
+if (ex.place_stop_orders or ex.place_limit_orders) and not ex.live_enabled:
+    print("\n⚠ Not in live mode — protective orders will be RECORDED but NOT placed. "
+          "Nothing actually rests at the exchange.")
+
+resting = store.resting_orders()
+if resting.empty:
+    print("\nNo protective orders currently resting.")
+else:
+    display(resting[["symbol", "kind", "order_type", "qty", "stop_price",
+                     "limit_price", "target_price", "status", "placed_at"]]
+            .style.hide(axis="index"))
 """),
 
 md(r"""
@@ -178,7 +369,6 @@ working default.
 code(r"""
 # Interactive: pick asset, timeframe, and overlays.
 import ipywidgets as widgets
-from IPython.display import clear_output, display
 
 symbol_w = widgets.Dropdown(options=CONFIG.symbols, value="BTC", description="Asset:")
 tf_w = widgets.ToggleButtons(
@@ -247,6 +437,13 @@ entirely of noise, so assets flagged `ambiguous` in the config match only as
 The score uses the log-ratio of current chatter to that asset's own baseline,
 damped by author diversity (so one person posting 40 times counts once-ish) and
 by how much of the text carried actual directional language.
+
+**Sources.** Reddit 403s anonymous `.json`, so the scraper falls through a
+ladder: official OAuth API → **Arctic Shift** (public Pushshift successor,
+keyless, carries scores) → **Reddit Atom feeds** (keyless, no scores) → legacy
+`.json`. It prints which one served. No credentials required; they just give a
+better feed. On the RSS tier vote scores are unavailable and engagement
+weighting goes flat — you'll see a notice when that happens.
 
 **Cold-start:** on a fresh database there is no baseline, so the first run's
 social scores are ~0 by construction. That is correct behaviour, not a bug —
@@ -351,9 +548,22 @@ md(r"""
 The cell below runs the full cycle and **prompts for each trade**. Answer `y` to
 approve, `n` or Enter to reject, `q` to stop reviewing.
 
+**Exits come first, and fund the entries.** Positions triggering an exit rule
+are proposed *and executed* ahead of any new entry, and do **not** consume the
+`max_proposals` budget. Their expected proceeds (less
+`risk.exit_proceeds_haircut_pct` for slippage and fees) are added to buying
+power, so the three buys can draw on capital the sells are about to release
+instead of leaving it idle. If you then reject a sell, the execution-time cash
+check still blocks the buy it was funding.
+Exits are also exempt from `min_composite_score` — a stop that has been hit is a
+fact about the position, not an opinion about its ranking. An asset under an
+exit signal is never proposed as a buy in the same run, even if the exit itself
+is too small to execute.
+
 **Spot markets cannot short.** A bearish score on an asset you don't hold is not
 a trade, it's an avoid — such assets appear in the ranking above but are never
-proposed. Bearish scores on assets you *do* hold become SELL (exit) proposals.
+proposed. Held assets are always scored even when they sit outside the
+configured universe; otherwise they would be silently unsellable.
 
 **Purchases can never exceed your cash.** Three checks, because each catches
 something the others miss:

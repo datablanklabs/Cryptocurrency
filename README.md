@@ -10,8 +10,10 @@ API.
 jupyter lab crypto_yolo_dashboard.ipynb
 ```
 
-Runs in paper mode out of the box with no credentials at all — though Feature 2
-needs free Reddit keys to return anything (see below).
+Runs in paper mode out of the box with **no credentials at all** — all three
+features work keyless, including Reddit sentiment (it falls back to Arctic Shift
+and Reddit's own Atom feeds). Credentials improve data quality and are needed
+only to place orders.
 
 ---
 
@@ -48,12 +50,15 @@ crypto_yolo_dashboard.ipynb   the dashboard (generated — edit build_notebook.p
 build_notebook.py             regenerates the notebook
 cryptoyolo/
   config.py       universe, weights, risk, execution settings, env loading
-  store.py        SQLite: posts, mentions, catalysts, scores, proposals, orders
+  store.py        SQLite: posts, mentions, catalysts, scores, proposals, orders,
+                  position_meta (entry terms that exits evaluate against)
   prices.py       OHLCV from Binance.US / Coinbase / Kraken / yfinance
   indicators.py   Bollinger, Keltner, Donchian, RSI, MACD, ATR
   charts.py       plotly candlesticks, universe grid, score attribution
-  social.py       Feature 2 — Reddit OAuth, mention extraction, sentiment
+  portfolio.py    Feature 0 — account balance, holdings, cost basis, P&L
+  social.py       Feature 2 — Reddit source ladder, mention extraction, sentiment
   catalysts.py    Feature 3 — GitHub releases, news RSS, event taxonomy
+  exits.py        five configurable exit triggers for open positions
   engine.py       scoring, ranking, risk-based position sizing
   broker.py       signed Binance REST client + paper broker
   approval.py     per-trade approval gate
@@ -64,7 +69,22 @@ data/             SQLite database (gitignored)
 
 ---
 
-## The three features
+## The features
+
+### 0 · Account balance and holdings
+
+Cash, open positions, market value, unrealised P&L and portfolio weights — shown
+before anything else, because position sizing, the cash cap and whether a SELL is
+even possible all depend on it.
+
+Cost basis is exact in paper mode (the book is ours). On a live Binance account
+only fills placed through this dashboard have a basis that can be honestly
+reported; anything bought elsewhere shows `—` rather than a guess. When the
+balance can't be read it reports *unavailable* rather than `$0.00`, so a missing
+credential never looks like an empty account.
+
+It also flags when `account_equity_usd` (the risk basis) has drifted more than
+20% from real equity, since sizing is computed from the former.
 
 ### 1 · Price charts with bands
 
@@ -96,9 +116,29 @@ uses the log-ratio of current chatter against each asset's *own* baseline,
 damped by author diversity (one person posting 40 times counts roughly once) and
 by how much text carried actual directional language.
 
-**Reddit requires OAuth.** Anonymous `.json` access now returns 403. Create a
-free script app at <https://www.reddit.com/prefs/apps> and set
-`REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET`.
+**Sources, in fallback order.** Reddit 403s anonymous `.json` clients, so the
+scraper tries four sources and uses the first that answers:
+
+| Source | Key? | Scores? | Notes |
+|---|---|---|---|
+| `oauth` | yes | yes | Official API. Real `hot` vs `new`, pagination, best limits |
+| `arctic` | **no** | **yes** | [Arctic Shift](https://arctic-shift.photon-reddit.com), a public Pushshift successor. 100/req, current |
+| `rss` | **no** | no | Reddit's own Atom feeds. Full comment bodies, ~25/req, rate-limited |
+| `public_json` | no | yes | Legacy anonymous `.json`. Usually 403; last resort |
+
+**Credentials are optional.** Without them the ladder falls through to Arctic
+Shift and the feature works — verified pulling 360 items and 36 mentions with no
+keys set. Credentials still give the best data, so set them if you have them.
+
+Two caveats on the keyless path. The RSS feed carries **no vote scores**, so
+engagement weighting goes flat (mention counts and sentiment are unaffected);
+the scraper prints a notice when it degrades to that. And the keyless sources
+are chronological only — they have no `hot`, so the scraper fetches one listing
+instead of two rather than burning duplicate requests on a shared public
+service.
+
+PullPush.io, the other well-known Pushshift successor, sits behind a Cloudflare
+challenge and isn't usable from a script — it's deliberately not in the ladder.
 
 **Cold start:** velocity needs history. On a fresh database the first run's
 social scores are ~0 by construction — correct behaviour, not a bug. Run the
@@ -114,6 +154,86 @@ direction — `record ETF inflows` and `ETF outflows accelerate` point opposite
 ways. Topic-type events take their sign from the headline's own tone;
 intrinsically directional events (an exploit is never good news) keep their
 prior and are discounted when tone disagrees.
+
+### Exit management
+
+Exits are evaluated **before** the buy-side ranking, against each position's own
+recorded entry terms rather than how attractive the asset looks today. Without
+that separation a deteriorating position only surfaces if it out-ranks every buy
+candidate — which it rarely does, so it just sits there.
+
+| Trigger | Fires when | Config |
+|---|---|---|
+| Stop hit | price ≤ the stop set at entry | `stop_loss` |
+| Target hit | price ≥ the target set at entry | `take_profit`, `take_profit_fraction` |
+| Trailing stop | gave back > `trail_pct` from the high-water mark | `trailing_stop`, `trail_pct`, `trail_activate_pct` |
+| Horizon expiry | held past the 1–7 day thesis | `horizon_expiry`, `horizon_days` |
+| Score reversal | composite ≤ threshold | `score_reversal`, `score_reversal_threshold` |
+
+Each is independently switchable; `CONFIG.exits.enabled = False` turns the whole
+pass off. Precedence when several fire is the table order — stop and target are
+level events that already happened, so they outrank the judgement calls.
+
+Four behaviours worth knowing:
+
+- **Exits get their own slots.** `max_exit_proposals` is separate from
+  `max_proposals`, so closing a position never costs you an entry slot.
+- **Exits ignore `min_composite_score`.** A stop that has been hit is a fact
+  about the position, not an opinion about its ranking.
+- **Held assets are always scored**, even outside the configured universe —
+  otherwise they are silently unsellable.
+- **An asset under an exit signal is never proposed as a buy** in the same run,
+  even when the exit itself is too small to meet the exchange minimum (the
+  position is left open, with a printed explanation).
+
+### Continuous protection between runs
+
+Everything above runs **only when you run the notebook** — a stop breached at 3am
+is acted on at your next run. Closing that gap needs an order resting at the
+venue: `place_stop_orders` and `place_limit_orders` submit one after each entry
+fills.
+
+| Setting | Effect |
+|---|---|
+| `place_stop_orders` | rest a protective stop after entry |
+| `place_limit_orders` | rest a take-profit at the target |
+| `place_stop_limit_orders` | stop leg uses `STOP_LOSS_LIMIT` (required on Binance.US) |
+| `use_oco` | send both legs as one OCO so filling one cancels the other |
+| `stop_limit_offset_bps` | how far through the trigger the limit sits (default 25) |
+| `use_trailing_delta` / `trailing_delta_bps` | let Binance trail the stop natively (10–2000 bps) |
+
+Five things that shaped this implementation:
+
+- **Binance.US has no market `STOP_LOSS`.** Its order types are `LIMIT`,
+  `LIMIT_MAKER`, `MARKET`, `STOP_LOSS_LIMIT`, `TAKE_PROFIT_LIMIT`. A protective
+  stop is therefore always a stop-*limit* — and **in a gap or fast flush the
+  limit may not fill, so the stop does not protect you.** The offset makes a fill
+  likelier; it cannot guarantee one. This is a property of the venue, not a bug.
+- **Both legs go as one OCO.** Two independent resting sells for the same
+  quantity could both fill, or the second be rejected for insufficient balance.
+  With `use_oco=False` and both flags on, only the stop is placed, with a warning.
+- **Resting sells lock the base asset,** so protection is cancelled automatically
+  before every SELL — otherwise the exit fails on free balance.
+- **Only stop and target can be delegated.** Horizon expiry and score reversal are
+  judgements this code makes, so they still require a run.
+- **Protection is only real in live mode.** Paper and validate-only record what
+  *would* rest but place nothing — Binance has no test endpoint for OCO, so it
+  cannot be dry-run validated at all. Binance also caps resting algo orders per
+  symbol (`MAX_NUM_ALGO_ORDERS`, currently 5).
+
+### Exits fund the entries
+
+Exits are proposed *and executed* before entries, so their expected proceeds
+(less `risk.exit_proceeds_haircut_pct` for slippage and fees) are added to buying
+power. With $1,000 cash and a $9,000 exit pending, the entries size against
+~$9,910 rather than leaving that capital idle. Reject the sell at the prompt and
+the execution-time cash check still blocks the buy it was funding.
+
+The trailing stop needs memory across runs, so each position carries a
+`position_meta` row (opened-at, stop, target, horizon, high-water mark) written
+on the entry fill and cleared when the position closes. Positions opened outside
+this dashboard have no such row: only score-reversal can act on them, and both
+the exit reason and the Feature 0 table say so rather than inventing terms.
 
 ---
 
@@ -216,7 +336,7 @@ the environment at runtime, and `.env` is gitignored.
 
 | Variable | For | Without it |
 |---|---|---|
-| `REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET` | Feature 2 | 403 — social score flat 0 |
+| `REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET` | Feature 2 | falls back to keyless sources; still works |
 | `BINANCE_API_KEY` / `BINANCE_API_SECRET` | Execution | paper mode works fully |
 | `GITHUB_TOKEN` | Feature 3 | works; 60 req/hr caps the scan |
 | `CRYPTO_YOLO_ALLOW_LIVE` | Live orders | orders stay validate-only |
