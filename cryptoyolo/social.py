@@ -3,10 +3,11 @@
 Three parts:
 
   RedditClient    Pulls posts and comments from r/wallstreetbets and
-                  r/cryptocurrency. Reddit blocks anonymous .json access with
-                  HTTP 403 from most hosts now, so the OAuth path (a free
-                  "script" app) is the real one; the public path stays as a
-                  fallback for hosts where it still works.
+                  r/cryptocurrency through a ladder of sources: the official
+                  OAuth API first, then two keyless fallbacks (Arctic Shift and
+                  Reddit's own Atom feeds). Reddit 403s anonymous .json now, so
+                  without the fallbacks this feature would need credentials to
+                  return anything at all.
 
   extract         Finds which assets a piece of text is about. The hard part is
                   precision, not recall: DOT, OP, NEAR, LINK, ATOM and friends
@@ -97,6 +98,13 @@ MULTIWORD = [p for p in LEXICON if " " in p]
 
 _TOKEN_RE = re.compile(r"[a-z0-9']+")
 _URL_RE = re.compile(r"https?://\S+")
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _strip_tags(text: str) -> str:
+    """Plain text out of the HTML fragment Reddit's Atom feed puts in <content>."""
+    import html as _html
+    return " ".join(_html.unescape(_TAG_RE.sub(" ", text or "")).split())
 
 
 def sentiment(text: str) -> tuple[float, float]:
@@ -182,17 +190,48 @@ def extract_symbols(text: str, patterns: dict) -> dict[str, str]:
 # Reddit client
 # --------------------------------------------------------------------------
 class RedditClient:
+    """Fetches posts and comments, degrading through a ladder of sources.
+
+    Reddit's anonymous .json endpoints return 403 from most hosts now, so
+    without OAuth credentials the official API is simply closed. Two public
+    alternatives still work and are tried in order:
+
+      oauth        Official API via a free "script" app. Best: full listings
+                   ('hot' vs 'new' are actually different), pagination, real
+                   scores. Needs REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET.
+
+      arctic       Arctic Shift (arctic-shift.photon-reddit.com), a public
+                   Pushshift successor. No auth, 100 items/request, and it
+                   carries `score` - the only keyless source that does.
+                   Chronological only, so 'hot' and 'new' return the same set.
+
+      rss          Reddit's own Atom feeds. Still served anonymously where
+                   .json is blocked. Carries id/author/timestamp/full body but
+                   *no score*, and caps around 25 items with aggressive rate
+                   limiting.
+
+      public_json  The legacy anonymous .json path. Kept last because it works
+                   from a few hosts, but expect 403.
+
+    PullPush.io, the other well-known Pushshift successor, sits behind a
+    Cloudflare challenge and is not usable from a script - it is deliberately
+    not in the ladder.
+    """
+
     OAUTH = "https://oauth.reddit.com"
     PUBLIC = "https://www.reddit.com"
+    ARCTIC = "https://arctic-shift.photon-reddit.com/api"
 
-    def __init__(self, cfg: Config = CONFIG):
+    def __init__(self, cfg: Config = CONFIG, sources: tuple[str, ...] | None = None):
         self.cfg = cfg
         self.session = requests.Session()
         self.ua = get_secret("reddit_user_agent") or cfg.user_agent
         self.session.headers.update({"User-Agent": self.ua})
         self._token: str | None = None
         self._token_expiry: float = 0.0
-        self.mode = "unauthenticated"
+        self.mode = "none"
+        self.sources = sources or cfg.reddit.sources
+        self.degraded: list[str] = []
 
     # -- auth ---------------------------------------------------------------
     def authenticate(self) -> bool:
@@ -213,50 +252,56 @@ class RedditClient:
             payload = r.json()
             self._token = payload["access_token"]
             self._token_expiry = time.time() + float(payload.get("expires_in", 3600))
-            self.mode = "oauth"
             return True
-        except Exception as exc:  # noqa: BLE001 - degrade to the public endpoint
-            print(f"  ! Reddit OAuth failed ({exc}); falling back to public JSON")
+        except Exception as exc:  # noqa: BLE001 - fall down the source ladder
+            print(f"  ! Reddit OAuth failed ({exc}); trying keyless sources")
             return False
 
-    def _request(self, path: str, params: dict) -> dict | None:
-        authed = self.authenticate()
-        base = self.OAUTH if authed else self.PUBLIC
-        url = f"{base}{path}" if authed else f"{base}{path}.json"
-        headers = {"User-Agent": self.ua}
-        if authed:
-            headers["Authorization"] = f"Bearer {self._token}"
-
-        for attempt in range(self.cfg.http_retries):
+    def _get(self, url: str, params: dict, headers: dict | None = None,
+             tries: int | None = None) -> Any:
+        tries = tries or self.cfg.http_retries
+        for attempt in range(tries):
             try:
-                r = self.session.get(url, params=params, headers=headers,
+                r = self.session.get(url, params=params,
+                                     headers=headers or {"User-Agent": self.ua},
                                      timeout=self.cfg.http_timeout)
                 if r.status_code in (429, 503):
-                    time.sleep(2 ** attempt + 1)
+                    time.sleep(3 * (attempt + 1))
                     continue
                 if r.status_code == 403:
-                    raise PermissionError(
-                        "Reddit returned 403. Anonymous access is blocked - set "
-                        "REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET (free script app "
-                        "at https://www.reddit.com/prefs/apps)."
-                    )
+                    raise PermissionError("403")
                 r.raise_for_status()
                 return r.json()
             except PermissionError:
                 raise
-            except Exception:  # noqa: BLE001 - retry with backoff
+            except Exception:  # noqa: BLE001 - retry, then give up on this source
                 time.sleep(0.6 * (attempt + 1))
         return None
 
-    # -- fetching -----------------------------------------------------------
-    def listing(self, subreddit: str, listing: str = "new",
-                limit: int = 100) -> list[dict[str, Any]]:
+    # -- normalizers --------------------------------------------------------
+    @staticmethod
+    def _row(post_id, subreddit, kind, author, created, score, ncomments,
+             title, body, permalink) -> dict[str, Any]:
+        return {
+            "post_id": post_id, "subreddit": subreddit, "kind": kind,
+            "author": author, "created_utc": float(created or 0),
+            "score": int(score or 0), "num_comments": int(ncomments or 0),
+            "title": title or "", "body": body or "",
+            "permalink": permalink or "", "fetched_at": iso(),
+        }
+
+    # -- source: official API ----------------------------------------------
+    def _oauth(self, subreddit: str, path: str, limit: int, kind: str) -> list[dict]:
+        if not self.authenticate():
+            return []
         rows, after, fetched = [], None, 0
         while fetched < limit:
             params = {"limit": min(100, limit - fetched), "raw_json": 1}
             if after:
                 params["after"] = after
-            payload = self._request(f"/r/{subreddit}/{listing}", params)
+            payload = self._get(f"{self.OAUTH}/r/{subreddit}/{path}", params,
+                                headers={"User-Agent": self.ua,
+                                         "Authorization": f"Bearer {self._token}"})
             if not payload or "data" not in payload:
                 break
             children = payload["data"].get("children", [])
@@ -264,19 +309,17 @@ class RedditClient:
                 break
             for ch in children:
                 d = ch.get("data", {})
-                rows.append({
-                    "post_id": f"t3_{d.get('id')}",
-                    "subreddit": subreddit,
-                    "kind": "post",
-                    "author": d.get("author"),
-                    "created_utc": float(d.get("created_utc") or 0),
-                    "score": int(d.get("score") or 0),
-                    "num_comments": int(d.get("num_comments") or 0),
-                    "title": d.get("title") or "",
-                    "body": d.get("selftext") or "",
-                    "permalink": f"https://reddit.com{d.get('permalink', '')}",
-                    "fetched_at": iso(),
-                })
+                if kind == "post":
+                    rows.append(self._row(f"t3_{d.get('id')}", subreddit, "post",
+                                          d.get("author"), d.get("created_utc"),
+                                          d.get("score"), d.get("num_comments"),
+                                          d.get("title"), d.get("selftext"),
+                                          f"https://reddit.com{d.get('permalink','')}"))
+                else:
+                    rows.append(self._row(f"t1_{d.get('id')}", subreddit, "comment",
+                                          d.get("author"), d.get("created_utc"),
+                                          d.get("score"), 0, "", d.get("body"),
+                                          f"https://reddit.com{d.get('permalink','')}"))
             fetched += len(children)
             after = payload["data"].get("after")
             if not after:
@@ -284,33 +327,147 @@ class RedditClient:
             time.sleep(0.6)
         return rows
 
+    # -- source: Arctic Shift ----------------------------------------------
+    def _arctic(self, subreddit: str, limit: int, kind: str) -> list[dict]:
+        endpoint = "posts" if kind == "post" else "comments"
+        payload = self._get(f"{self.ARCTIC}/{endpoint}/search",
+                            {"subreddit": subreddit, "limit": min(100, limit),
+                             "sort": "desc"})
+        if not payload or "data" not in payload:
+            return []
+        rows = []
+        for d in payload["data"]:
+            pid = d.get("id", "")
+            if kind == "post":
+                rows.append(self._row(f"t3_{pid}", subreddit, "post", d.get("author"),
+                                      d.get("created_utc"), d.get("score"),
+                                      d.get("num_comments"), d.get("title"),
+                                      d.get("selftext"),
+                                      f"https://reddit.com{d.get('permalink','')}"))
+            else:
+                rows.append(self._row(f"t1_{pid}", subreddit, "comment", d.get("author"),
+                                      d.get("created_utc"), d.get("score"), 0, "",
+                                      d.get("body"),
+                                      f"https://reddit.com{d.get('permalink','')}"))
+        return rows
+
+    # -- source: Reddit Atom feeds -----------------------------------------
+    def _rss(self, subreddit: str, limit: int, kind: str) -> list[dict]:
+        import xml.etree.ElementTree as ET
+        from datetime import datetime as _dt
+
+        path = "comments" if kind == "comment" else "new"
+        url = f"{self.PUBLIC}/r/{subreddit}/{path}/.rss"
+        for attempt in range(4):
+            try:
+                r = self.session.get(url, params={"limit": min(100, limit)},
+                                     headers={"User-Agent": self.ua},
+                                     timeout=self.cfg.http_timeout)
+                if r.status_code in (429, 503):
+                    time.sleep(4 * (attempt + 1))
+                    continue
+                r.raise_for_status()
+                text = r.text
+                break
+            except Exception:  # noqa: BLE001
+                time.sleep(2 * (attempt + 1))
+        else:
+            return []
+
+        try:
+            root = ET.fromstring(text)
+        except ET.ParseError:
+            return []
+
+        ns = {"a": "http://www.w3.org/2005/Atom"}
+        rows = []
+        for e in root.findall(".//a:entry", ns):
+            raw_id = e.findtext("a:id", "", ns) or ""
+            author_el = e.find("a:author/a:name", ns)
+            author = (author_el.text or "").lstrip("/u/") if author_el is not None else None
+            updated = e.findtext("a:updated", "", ns)
+            try:
+                created = _dt.fromisoformat(updated.replace("Z", "+00:00")).timestamp()
+            except Exception:  # noqa: BLE001 - undated entry
+                created = 0.0
+            content = e.findtext("a:content", "", ns) or ""
+            body = _strip_tags(content)
+            title = e.findtext("a:title", "", ns) or ""
+            link_el = e.find("a:link", ns)
+            link = link_el.get("href") if link_el is not None else ""
+            is_comment = raw_id.startswith("t1_")
+            rows.append(self._row(
+                raw_id or link, subreddit,
+                "comment" if is_comment else "post", author, created,
+                0,          # RSS carries no score - engagement weighting degrades
+                0,
+                "" if is_comment else title,
+                body, link,
+            ))
+        return rows
+
+    # -- source: legacy anonymous JSON --------------------------------------
+    def _public_json(self, subreddit: str, path: str, limit: int, kind: str) -> list[dict]:
+        payload = self._get(f"{self.PUBLIC}/r/{subreddit}/{path}.json",
+                            {"limit": min(100, limit), "raw_json": 1}, tries=1)
+        if not payload or "data" not in payload:
+            return []
+        rows = []
+        for ch in payload["data"].get("children", []):
+            d = ch.get("data", {})
+            if kind == "post":
+                rows.append(self._row(f"t3_{d.get('id')}", subreddit, "post",
+                                      d.get("author"), d.get("created_utc"),
+                                      d.get("score"), d.get("num_comments"),
+                                      d.get("title"), d.get("selftext"),
+                                      f"https://reddit.com{d.get('permalink','')}"))
+            else:
+                rows.append(self._row(f"t1_{d.get('id')}", subreddit, "comment",
+                                      d.get("author"), d.get("created_utc"),
+                                      d.get("score"), 0, "", d.get("body"),
+                                      f"https://reddit.com{d.get('permalink','')}"))
+        return rows
+
+    # -- public API ---------------------------------------------------------
+    def _try_sources(self, subreddit: str, listing: str, limit: int,
+                     kind: str) -> list[dict]:
+        for source in self.sources:
+            try:
+                if source == "oauth":
+                    rows = self._oauth(subreddit, listing if kind == "post" else "comments",
+                                       limit, kind)
+                elif source == "arctic":
+                    rows = self._arctic(subreddit, limit, kind)
+                elif source == "rss":
+                    rows = self._rss(subreddit, limit, kind)
+                elif source == "public_json":
+                    rows = self._public_json(subreddit,
+                                             listing if kind == "post" else "comments",
+                                             limit, kind)
+                else:
+                    continue
+            except PermissionError:
+                continue
+            except Exception:  # noqa: BLE001 - try the next source
+                continue
+            if rows:
+                self.mode = source
+                if source in ("rss",) and "no-scores" not in self.degraded:
+                    self.degraded.append("no-scores")
+                return rows
+        return []
+
+    def listing(self, subreddit: str, listing: str = "new",
+                limit: int = 100) -> list[dict[str, Any]]:
+        return self._try_sources(subreddit, listing, limit, "post")
+
     def comments(self, subreddit: str, limit: int = 100) -> list[dict[str, Any]]:
         """Recent comments across the whole subreddit.
 
         Much cheaper than walking each post's comment tree, and comments are
         where the actual opinions live - post titles are mostly memes.
         """
-        payload = self._request(f"/r/{subreddit}/comments",
-                                {"limit": min(100, limit), "raw_json": 1})
-        if not payload or "data" not in payload:
-            return []
-        rows = []
-        for ch in payload["data"].get("children", []):
-            d = ch.get("data", {})
-            rows.append({
-                "post_id": f"t1_{d.get('id')}",
-                "subreddit": subreddit,
-                "kind": "comment",
-                "author": d.get("author"),
-                "created_utc": float(d.get("created_utc") or 0),
-                "score": int(d.get("score") or 0),
-                "num_comments": 0,
-                "title": "",
-                "body": d.get("body") or "",
-                "permalink": f"https://reddit.com{d.get('permalink', '')}",
-                "fetched_at": iso(),
-            })
-        return rows
+        return self._try_sources(subreddit, "comments", limit, "comment")
 
 
 # --------------------------------------------------------------------------
@@ -334,6 +491,14 @@ def scrape(store: Store, cfg: Config = CONFIG, verbose: bool = True) -> dict[str
                 all_rows.extend(rows)
                 if verbose:
                     print(f"  r/{sub}/{listing:<4} {len(rows):>4} posts   [{client.mode}]")
+                # Keyless sources are chronological only - they have no notion of
+                # 'hot' vs 'new' and return the identical rows, so asking twice
+                # just burns requests against a shared public service.
+                if client.mode in ("arctic", "rss") and len(rc.listings) > 1:
+                    if verbose:
+                        print(f"       (source is chronological; skipping "
+                              f"{', '.join(rc.listings[1:])})")
+                    break
             except PermissionError as exc:
                 if verbose:
                     print(f"  r/{sub}/{listing}: {exc}")
@@ -353,7 +518,15 @@ def scrape(store: Store, cfg: Config = CONFIG, verbose: bool = True) -> dict[str
                     print(f"  r/{sub}/comments: failed ({exc})")
 
     if not all_rows:
-        return {"posts": 0, "mentions": 0, "blocked": 0}
+        if verbose:
+            print("  ! No source returned data. With no Reddit credentials this "
+                  "usually means the keyless fallbacks are down or rate-limited; "
+                  "set REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET for a reliable feed.")
+        return {"posts": 0, "mentions": 0, "blocked": 1, "source": client.mode}
+
+    if verbose and "no-scores" in client.degraded:
+        print("  ~ Source carries no vote scores; engagement weighting is flat. "
+              "Mention counts and sentiment are unaffected.")
 
     store.upsert_posts(all_rows)
 
@@ -384,8 +557,10 @@ def scrape(store: Store, cfg: Config = CONFIG, verbose: bool = True) -> dict[str
 
     store.upsert_mentions(mentions)
     if verbose:
-        print(f"  -> {len(all_rows)} items, {len(mentions)} symbol mentions stored")
-    return {"posts": len(all_rows), "mentions": len(mentions), "blocked": 0}
+        print(f"  -> {len(all_rows)} items, {len(mentions)} symbol mentions stored "
+              f"[source: {client.mode}]")
+    return {"posts": len(all_rows), "mentions": len(mentions), "blocked": 0,
+            "source": client.mode, "degraded": list(client.degraded)}
 
 
 # --------------------------------------------------------------------------

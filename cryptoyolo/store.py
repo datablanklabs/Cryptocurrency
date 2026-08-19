@@ -132,6 +132,49 @@ CREATE TABLE IF NOT EXISTS paper_cash (
     id      INTEGER PRIMARY KEY CHECK (id = 1),
     balance REAL NOT NULL
 );
+
+-- Entry metadata for open positions, kept as a sidecar keyed by symbol.
+-- Deliberately separate from paper_positions: the *quantity* comes from the
+-- paper book or from Binance balances depending on mode, but the exit terms
+-- (when it was opened, where the stop is, how high it has run) are ours either
+-- way. Without this table a position has no memory and no exit can be time- or
+-- level-based.
+CREATE TABLE IF NOT EXISTS position_meta (
+    symbol       TEXT PRIMARY KEY,
+    opened_at    TEXT NOT NULL,
+    entry_price  REAL,
+    stop         REAL,
+    target       REAL,
+    horizon_days REAL,
+    high_water   REAL,
+    proposal_id  TEXT,
+    mode         TEXT,
+    updated_at   TEXT
+);
+
+-- Protective orders resting at the exchange (or simulated in paper mode).
+-- Tracked locally because a resting sell LOCKS the asset: an exit that tries to
+-- market-sell without cancelling these first fails on insufficient free balance.
+CREATE TABLE IF NOT EXISTS protective_orders (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol       TEXT NOT NULL,
+    kind         TEXT NOT NULL,       -- 'oco' | 'stop' | 'target'
+    order_type   TEXT,
+    exchange_ref TEXT,
+    order_list_id TEXT,
+    qty          REAL,
+    stop_price   REAL,
+    limit_price  REAL,
+    target_price REAL,
+    trailing_delta INTEGER,
+    status       TEXT,                -- 'resting' | 'cancelled' | 'simulated' | 'failed'
+    mode         TEXT,
+    venue        TEXT,
+    placed_at    TEXT NOT NULL,
+    updated_at   TEXT,
+    response     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_protective_symbol ON protective_orders(symbol, status);
 """
 
 
@@ -151,10 +194,28 @@ class Store:
 
     @contextmanager
     def conn(self) -> Iterator[sqlite3.Connection]:
+        """Open a connection, re-creating the database if it has gone missing.
+
+        The directory is only guaranteed to exist at construction time, but a
+        Store instance can outlive it - a cleanup script, a synced folder that
+        unmounts, an external drive. Previously that surfaced mid-run as
+        "OperationalError: unable to open database file", which is an unhelpful
+        way to lose a trading cycle. Re-creating the directory and schema on
+        demand makes the store self-healing: you lose the history, but the run
+        completes and the audit trail continues.
+        """
+        missing = not self.db_path.exists()
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         con = sqlite3.connect(self.db_path, timeout=30)
         con.row_factory = sqlite3.Row
         try:
             con.execute("PRAGMA journal_mode=WAL")
+            if missing:
+                con.executescript(SCHEMA)
+                con.execute(
+                    "INSERT OR IGNORE INTO paper_cash(id, balance) VALUES (1, ?)",
+                    (10_000.0,),
+                )
             yield con
             con.commit()
         finally:
@@ -344,6 +405,97 @@ class Store:
                 "notional, decision FROM proposals ORDER BY ts DESC LIMIT ?",
                 con, params=(limit,),
             )
+
+    # -- position metadata --------------------------------------------------
+    def upsert_position_meta(self, row: dict[str, Any]) -> None:
+        row = {**row}
+        row.setdefault("updated_at", iso())
+        row.setdefault("high_water", row.get("entry_price"))
+        with self.conn() as con:
+            con.execute(
+                """INSERT INTO position_meta
+                   (symbol, opened_at, entry_price, stop, target, horizon_days,
+                    high_water, proposal_id, mode, updated_at)
+                   VALUES (:symbol,:opened_at,:entry_price,:stop,:target,
+                           :horizon_days,:high_water,:proposal_id,:mode,:updated_at)
+                   ON CONFLICT(symbol) DO UPDATE SET
+                     entry_price=excluded.entry_price,
+                     stop=excluded.stop,
+                     target=excluded.target,
+                     horizon_days=excluded.horizon_days,
+                     proposal_id=excluded.proposal_id,
+                     updated_at=excluded.updated_at""",
+                row,
+            )
+
+    def position_meta(self, symbol: str | None = None) -> pd.DataFrame:
+        with self.conn() as con:
+            if symbol:
+                return pd.read_sql_query(
+                    "SELECT * FROM position_meta WHERE symbol=?", con, params=(symbol,))
+            return pd.read_sql_query("SELECT * FROM position_meta", con)
+
+    def bump_high_water(self, symbol: str, price: float) -> float:
+        """Raise the high-water mark; never lowers it. Returns the mark in force."""
+        with self.conn() as con:
+            row = con.execute(
+                "SELECT high_water FROM position_meta WHERE symbol=?", (symbol,)
+            ).fetchone()
+            if row is None:
+                return price
+            current = float(row["high_water"] or 0.0)
+            if price > current:
+                con.execute(
+                    "UPDATE position_meta SET high_water=?, updated_at=? WHERE symbol=?",
+                    (price, iso(), symbol),
+                )
+                return price
+            return current
+
+    def delete_position_meta(self, symbol: str) -> None:
+        with self.conn() as con:
+            con.execute("DELETE FROM position_meta WHERE symbol=?", (symbol,))
+
+    # -- protective orders --------------------------------------------------
+    def save_protective_order(self, row: dict[str, Any]) -> None:
+        row = {**row}
+        row.setdefault("updated_at", iso())
+        row.setdefault("placed_at", iso())
+        with self.conn() as con:
+            con.execute(
+                """INSERT INTO protective_orders
+                   (symbol, kind, order_type, exchange_ref, order_list_id, qty,
+                    stop_price, limit_price, target_price, trailing_delta,
+                    status, mode, venue, placed_at, updated_at, response)
+                   VALUES (:symbol,:kind,:order_type,:exchange_ref,:order_list_id,
+                           :qty,:stop_price,:limit_price,:target_price,
+                           :trailing_delta,:status,:mode,:venue,:placed_at,
+                           :updated_at,:response)""",
+                row,
+            )
+
+    def resting_orders(self, symbol: str | None = None) -> pd.DataFrame:
+        q = "SELECT * FROM protective_orders WHERE status='resting'"
+        params: tuple = ()
+        if symbol:
+            q += " AND symbol=?"
+            params = (symbol,)
+        with self.conn() as con:
+            return pd.read_sql_query(q + " ORDER BY placed_at DESC", con, params=params)
+
+    def mark_protective_cancelled(self, symbol: str) -> int:
+        """Retire both live ('resting') and paper ('simulated') protection.
+
+        Simulated rows are included so the table reflects reality after a
+        position closes, rather than accumulating stale protection for
+        positions that no longer exist.
+        """
+        with self.conn() as con:
+            cur = con.execute(
+                "UPDATE protective_orders SET status='cancelled', updated_at=? "
+                "WHERE symbol=? AND status IN ('resting','simulated')", (iso(), symbol),
+            )
+            return cur.rowcount
 
     # -- paper book ---------------------------------------------------------
     def paper_cash(self) -> float:

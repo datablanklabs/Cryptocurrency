@@ -268,11 +268,26 @@ def propose(scores: pd.DataFrame, store: Store, run_id: str, cfg: Config = CONFI
     """
     risk = cfg.risk
     holdings = holdings or {}
+
+    def _empty(reason: dict) -> pd.DataFrame:
+        df = pd.DataFrame()
+        df.attrs["skipped"] = reason
+        df.attrs["cash_available"] = cash_available
+        df.attrs["min_notional_usd"] = risk.min_notional_usd
+        df.attrs["min_composite_score"] = risk.min_composite_score
+        return df
+
     if scores.empty:
-        return pd.DataFrame()
+        return _empty({"no_scores": 1})
 
     candidates: list[dict[str, Any]] = []
     exiting: set[str] = set()
+    # Why candidates were dropped. An empty slate is a legitimate outcome, but
+    # "no proposals" is only useful if it says which constraint bound - the
+    # earlier version blamed the score threshold even when the real blocker was
+    # an empty wallet, which is a misdiagnosis, not a shortcut.
+    skipped: dict[str, int] = {"below_score": 0, "bearish_unheld": 0,
+                               "below_min_notional": 0, "flagged_for_exit": 0}
     # Every symbol under an exit signal, whether or not the exit itself makes it
     # into a slot. A dust-sized position can fail the minimum-notional check and
     # so produce no sellable ticket - but it must still never come back as a BUY
@@ -337,8 +352,10 @@ def propose(scores: pd.DataFrame, store: Store, run_id: str, cfg: Config = CONFI
         composite = float(row["composite"])
         symbol = row["symbol"]
         if symbol in flagged_for_exit:
+            skipped["flagged_for_exit"] += 1
             continue            # closing (or flagged to close) — never re-enter
         if abs(composite) < risk.min_composite_score:
+            skipped["below_score"] += 1
             continue
 
         held = float(holdings.get(symbol, 0.0))
@@ -347,6 +364,7 @@ def propose(scores: pd.DataFrame, store: Store, run_id: str, cfg: Config = CONFI
         elif held > 0:
             side = "SELL"
         else:
+            skipped["bearish_unheld"] += 1
             continue        # bearish with no position: spot can't short — skip
 
         entry = float(row["price"])
@@ -380,6 +398,7 @@ def propose(scores: pd.DataFrame, store: Store, run_id: str, cfg: Config = CONFI
 
         notional = qty * entry
         if notional < risk.min_notional_usd or qty <= 0:
+            skipped["below_min_notional"] += 1
             continue
 
         candidates.append({
@@ -391,7 +410,7 @@ def propose(scores: pd.DataFrame, store: Store, run_id: str, cfg: Config = CONFI
         })
 
     if not candidates:
-        return pd.DataFrame()
+        return _empty(skipped)
 
     # Slate-level caps. Both apply to BUYs only - a SELL frees capital, so
     # scaling exits down to respect a *deployment* limit is backwards.
@@ -420,7 +439,7 @@ def propose(scores: pd.DataFrame, store: Store, run_id: str, cfg: Config = CONFI
         print(f"  [{binding} cap] no spendable balance — all BUY proposals dropped.")
 
     if not candidates:
-        return pd.DataFrame()
+        return _empty(skipped)
 
     from . import exits as exits_mod
 
@@ -498,11 +517,41 @@ def fmt_qty(x: float) -> str:
 def format_proposals(proposals: pd.DataFrame) -> str:
     """Readable summary for the approval prompt."""
     if proposals.empty:
-        return ("No proposals this run. Either nothing cleared "
-                "`risk.min_composite_score`, or the candidates that did were bearish "
-                "on assets you don't hold — which spot markets can't express as a "
-                "trade. Both are valid outputs; the engine is not required to "
-                "manufacture three trades every run.")
+        sk = proposals.attrs.get("skipped", {}) or {}
+        cash = proposals.attrs.get("cash_available")
+        min_notional = proposals.attrs.get("min_notional_usd", 0.0)
+        min_score = proposals.attrs.get("min_composite_score", 0.0)
+
+        lines = ["No proposals this run."]
+        # Lead with the constraint that actually bound. An empty wallet and a
+        # flat scoreboard are very different problems and need different fixes.
+        if sk.get("below_min_notional"):
+            n = sk["below_min_notional"]
+            lines.append(
+                f"  · {n} candidate(s) scored well enough but sized below the "
+                f"${min_notional:,.2f} minimum order."
+            )
+            if cash is not None and cash < min_notional:
+                lines.append(
+                    f"    Spendable balance is ${cash:,.2f} — that is the binding "
+                    f"constraint, not the scores. Add quote-asset funds, or lower "
+                    f"CONFIG.risk.min_notional_usd if your venue allows smaller orders."
+                )
+        if sk.get("below_score"):
+            lines.append(f"  · {sk['below_score']} scored under "
+                         f"min_composite_score ({min_score:+.2f}).")
+        if sk.get("bearish_unheld"):
+            lines.append(f"  · {sk['bearish_unheld']} were bearish on assets you "
+                         f"don't hold — spot can't short, so that's an avoid.")
+        if sk.get("flagged_for_exit"):
+            lines.append(f"  · {sk['flagged_for_exit']} are already flagged for exit.")
+        if sk.get("no_scores"):
+            lines.append("  · No assets could be scored at all (price fetch failed?).")
+        if len(lines) == 1:
+            lines.append("  · Nothing cleared the entry filters.")
+        lines.append("An empty slate is a valid output; the engine is not required "
+                     "to manufacture three trades every run.")
+        return "\n".join(lines)
     lines: list[str] = []
     for _, p in proposals.iterrows():
         is_exit = p.get("kind") == "exit"

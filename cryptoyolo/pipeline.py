@@ -12,7 +12,7 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from . import approval, broker as broker_mod, catalysts, engine, social
+from . import approval, broker as broker_mod, catalysts, engine, exits, social
 from .config import CONFIG, Config, credential_status, load_dotenv
 from .store import Store, iso, utcnow
 
@@ -58,8 +58,19 @@ def run(store: Store, cfg: Config = CONFIG, scrape_reddit: bool = True,
 
     stats = collect(store, cfg, scrape_reddit, scan_catalysts)
 
+    # Holdings first: assets you own must be scored even when they sit outside
+    # the configured universe, or they can never produce an exit signal.
+    pre_broker = broker_mod.get_broker(store, cfg)
+    held_symbols = [s for s, q in (pre_broker.holdings() or {}).items()
+                    if q > 0 and s != cfg.execution.quote_asset]
+
     print("\n[scoring] building composite scores...")
-    scores = engine.build_scores(store, cfg)
+    if held_symbols:
+        outside = [s for s in held_symbols if s not in set(cfg.symbols)]
+        if outside:
+            print(f"  including {len(outside)} held asset(s) outside the universe: "
+                  f"{', '.join(outside)}")
+    scores = engine.build_scores(store, cfg, extra_symbols=held_symbols)
     if scores.empty:
         print("  No scoreable assets — aborting.")
         store.finish_run(run_id)
@@ -68,9 +79,21 @@ def run(store: Store, cfg: Config = CONFIG, scrape_reddit: bool = True,
 
     store.save_scores(run_id, scores.to_dict("records"))
 
-    broker = broker_mod.get_broker(store, cfg)
+    broker = pre_broker
     holdings = broker.holdings()
     cash = broker.available_cash()
+
+    print("\n[exits] reviewing open positions...")
+    exit_signals = exits.evaluate(store, cfg, holdings, scores)
+    if not cfg.exits.enabled:
+        print("  exit management disabled (CONFIG.exits.enabled = False)")
+    elif exit_signals.empty:
+        n_open = len([s for s, q in holdings.items()
+                      if q > 0 and s != cfg.execution.quote_asset])
+        print(f"  {n_open} open position(s); no exit trigger fired")
+    else:
+        for _, sig in exit_signals.iterrows():
+            print(f"  ⟵ {sig['symbol']:<6} {sig['trigger_label']:<16} {sig['reason']}")
 
     print("\n[proposals] ranking candidates...")
     if cash is None:
@@ -81,14 +104,15 @@ def run(store: Store, cfg: Config = CONFIG, scrape_reddit: bool = True,
         print(f"  spendable balance: ${cash:,.2f}   ·   deployment cap: ${deploy_cap:,.2f}"
               f"   ·   binding: {'cash' if cash < deploy_cap else 'deployment'}")
 
-    proposals = engine.propose(scores, store, run_id, cfg, holdings, cash_available=cash)
+    proposals = engine.propose(scores, store, run_id, cfg, holdings,
+                               cash_available=cash, exit_signals=exit_signals)
 
     if proposals.empty:
         print(engine.format_proposals(proposals))
         store.finish_run(run_id)
         return {"run_id": run_id, "scores": scores, "proposals": proposals,
                 "executions": pd.DataFrame(), "stats": stats,
-                "holdings": holdings, "cash": cash}
+                "holdings": holdings, "cash": cash, "exit_signals": exit_signals}
 
     preflight = {p["proposal_id"]: broker.preflight(p.to_dict())
                  for _, p in proposals.iterrows()}
@@ -99,7 +123,8 @@ def run(store: Store, cfg: Config = CONFIG, scrape_reddit: bool = True,
         store.finish_run(run_id)
         return {"run_id": run_id, "scores": scores, "proposals": proposals,
                 "executions": pd.DataFrame(), "stats": stats,
-                "preflight": preflight, "holdings": holdings, "cash": cash}
+                "preflight": preflight, "holdings": holdings, "cash": cash,
+                "exit_signals": exit_signals}
 
     reviewed = approval.request_approval(proposals, cfg, input_fn, preflight)
 
@@ -109,7 +134,8 @@ def run(store: Store, cfg: Config = CONFIG, scrape_reddit: bool = True,
     store.finish_run(run_id)
     return {"run_id": run_id, "scores": scores, "proposals": reviewed,
             "executions": executions, "stats": stats,
-            "preflight": preflight, "holdings": holdings, "cash": cash}
+            "preflight": preflight, "holdings": holdings, "cash": cash,
+            "exit_signals": exit_signals}
 
 
 def status(cfg: Config = CONFIG) -> pd.DataFrame:
