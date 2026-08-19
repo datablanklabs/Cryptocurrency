@@ -594,8 +594,15 @@ result = pipeline.run(
     interactive=True,        # False = show proposals, execute nothing
 )
 
-result["proposals"][["rank", "symbol", "side", "composite", "entry", "stop",
-                     "target", "qty", "notional", "reward_risk", "decision"]]
+# An empty slate is a normal outcome, so guard before subscripting columns —
+# propose() returns a bare DataFrame with no columns when nothing qualifies.
+_props = result["proposals"]
+if _props.empty:
+    print("No proposals to review this run — see the diagnosis above.")
+else:
+    _cols = ["rank", "symbol", "side", "kind", "trigger", "composite", "entry",
+             "stop", "target", "qty", "notional", "reward_risk", "decision"]
+    display(_props[[c for c in _cols if c in _props.columns]])
 """),
 
 md("## Portfolio & audit trail"),
@@ -657,15 +664,35 @@ CRYPTO_YOLO_ALLOW_LIVE=1 jupyter lab
 from US IP addresses. `binance-us` is the default and works. Switch with
 `CONFIG.execution.venue`.
 
-### Keep the Reddit history warm
+### Keep collecting while you trade manually
 
-Feature 2 is only as good as its baseline. A cron entry collecting every 30
-minutes is what turns social from noise into signal:
+Feature 2's velocity signal needs history that accrues in real time, so run the
+collector on a schedule and use this notebook manually. They share the SQLite
+database safely — WAL mode, verified with a collector writing while a notebook
+reader held an open connection: no lock errors, and the reader sees new commits.
+
+Install the 8-hourly job (00:00 / 08:00 / 16:00 local, plus once at load):
 
 ```bash
-*/30 * * * * cd /Users/socrates/Documents/notebooks/crypto-yolo && \
-  /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 -m cryptoyolo.scheduler --once >> data/collector.log 2>&1
+cd /Users/socrates/Documents/notebooks/crypto-yolo
+cp com.crypto-yolo.collector.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.crypto-yolo.collector.plist
 ```
+
+Check on it:
+
+```bash
+launchctl list | grep crypto-yolo     # 2nd column = last exit code (0 = fine)
+./collect.py --status                 # history span, and whether velocity is ready
+tail -f data/collector.log            # watch a pass run
+```
+
+`collect.py` bootstraps its own path so it runs from any directory, and an
+`flock` guard means a stalled pass can never stack a second writer on the
+database. To stop it: `launchctl unload ~/Library/LaunchAgents/com.crypto-yolo.collector.plist`.
+
+The in-notebook `scheduler.start(...)` thread is fine for a single session but
+dies with the kernel — use launchd for the baseline.
 
 ### Worth doing before trusting the scores
 

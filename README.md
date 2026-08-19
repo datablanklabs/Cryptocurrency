@@ -48,6 +48,8 @@ This is not financial advice. You approve every trade; you own every outcome.
 ```
 crypto_yolo_dashboard.ipynb   the dashboard (generated — edit build_notebook.py)
 build_notebook.py             regenerates the notebook
+collect.py                    scheduled collector entry point (path-independent)
+com.crypto-yolo.collector.plist   launchd job, runs collect.py every 8h
 cryptoyolo/
   config.py       universe, weights, risk, execution settings, env loading
   store.py        SQLite: posts, mentions, catalysts, scores, proposals, orders,
@@ -63,7 +65,7 @@ cryptoyolo/
   broker.py       signed Binance REST client + paper broker
   approval.py     per-trade approval gate
   pipeline.py     end-to-end orchestration
-  scheduler.py    recurring collector (thread or cron)
+  scheduler.py    in-kernel collector thread (dies with the kernel)
 data/             SQLite database (gitignored)
 ```
 
@@ -311,21 +313,66 @@ it — and are separately capped at the quantity you actually hold.
 
 ---
 
-## Keeping the Reddit baseline warm
+## Running the collector on a schedule
 
-Feature 2 is only as good as its history. A cron entry turns social from noise
-into signal:
+Feature 2 is only as good as its baseline: mention *velocity* is measured against
+each asset's own history, so the data has to accrue in real time. Run the
+collector on a schedule and use the notebook manually — they share the SQLite
+database safely (WAL mode, verified with a collector writing while a notebook
+reader held an open connection: no lock errors, and the reader sees new commits).
+
+`collect.py` is the entry point. It bootstraps its own path, so it works from
+any directory — `python3 -m cryptoyolo.scheduler` only resolves when cwd happens
+to be the project root, which neither launchd nor cron guarantees.
 
 ```bash
-*/30 * * * * cd /Users/socrates/Documents/notebooks/crypto-yolo && \
-  /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 -m cryptoyolo.scheduler --once >> data/collector.log 2>&1
+./collect.py --catalysts    # Reddit + news + GitHub — what the scheduled job runs
+./collect.py                # Reddit only (faster)
+./collect.py --status       # what's collected so far, no network calls
 ```
 
-Or in-notebook, for as long as the kernel lives:
+An `flock` guard means overlapping runs are impossible: if one pass stalls on a
+slow feed, the next trigger exits immediately rather than stacking a second
+writer onto the database.
 
-```python
-collector = scheduler.start(store, CONFIG, interval_minutes=30)
+### Install the 8-hourly job (macOS launchd)
+
+```bash
+cp com.crypto-yolo.collector.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.crypto-yolo.collector.plist
 ```
+
+Runs at 00:00, 08:00 and 16:00 local, plus once immediately at load so you get
+confirmation it works. Calendar intervals rather than a raw 28800s timer, because
+launchd runs a missed calendar job when the Mac wakes — a plain interval can
+drift across sleep.
+
+```bash
+launchctl list | grep crypto-yolo          # 2nd column is last exit code (0 = fine)
+tail -f data/collector.log                 # watch it work
+./collect.py --status                      # is the baseline ready?
+launchctl unload ~/Library/LaunchAgents/com.crypto-yolo.collector.plist   # stop
+```
+
+The job runs only while you are logged in (a LaunchAgent, not a daemon), and not
+while the Mac is fully powered off — both fine for this, since a missed window
+just means slightly less history.
+
+### cron alternative
+
+```bash
+0 */8 * * * /Users/socrates/Documents/notebooks/crypto-yolo/collect.py --catalysts >> /Users/socrates/Documents/notebooks/crypto-yolo/data/collector.log 2>&1
+```
+
+Works, but on modern macOS `cron` needs Full Disk Access granted to `/usr/sbin/cron`
+in System Settings → Privacy & Security, or it fails silently. launchd is the
+better default here.
+
+### In-notebook alternative
+
+`scheduler.start(store, CONFIG, interval_minutes=480)` runs a thread inside the
+kernel. Convenient, but it dies with the kernel — use it for a session, not for
+the baseline.
 
 ---
 
