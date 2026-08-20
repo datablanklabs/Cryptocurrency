@@ -61,6 +61,7 @@ cryptoyolo/
   charts.py       plotly candlesticks, universe grid, score attribution
   portfolio.py    Feature 0 — account balance, holdings, cost basis, P&L
   social.py       Feature 2 — Reddit source ladder, mention extraction, sentiment
+  feeds.py        Feature 2b — StockTwits cashtags, Mastodon hashtags
   catalysts.py    Feature 3 — GitHub releases, news RSS, event taxonomy
   exits.py        five configurable exit triggers for open positions
   engine.py       scoring, ranking, risk-based position sizing
@@ -144,9 +145,101 @@ service.
 PullPush.io, the other well-known Pushshift successor, sits behind a Cloudflare
 challenge and isn't usable from a script — it's deliberately not in the ladder.
 
+**Sources measured, not guessed.** All 13 were sampled (200 items each) via
+Arctic Shift on 2026-08-20 and ranked by mention-rate x asset-breadth x tone.
+`span` is how much wall-clock time 200 items covers — low means active:
+
+| Subreddit | mention % | assets | tone | span |
+|---|---|---|---|---|
+| CryptoMarkets | 18.5% | 7 | 0.20 | 65h |
+| CryptoCurrency | 11.5% | 6 | 0.25 | 13h |
+| ethtrader | 33.0% | 4 | 0.13 | 326h |
+| Bitcoin | 29.0% | 2 | 0.21 | 10h |
+| defi | 13.0% | 5 | 0.16 | 200h |
+| SatoshiStreetBets | 12.5% | 8 | 0.10 | 2349h |
+| solana | 46.5% | 4 | 0.05 | 91h |
+| CryptoMoonShots | 9.0% | 4 | 0.22 | 239h |
+| altcoin | 12.5% | 10 | 0.06 | 1554h |
+| BitcoinMarkets | 19.0% | 2 | 0.16 | 721h |
+| CryptoCurrencyTrading | 4.5% | 3 | 0.13 | 482h |
+| CryptoTechnology | 8.0% | 3 | 0.06 | 340h |
+| binance | 5.0% | 4 | 0.02 | 207h |
+
+**The order re-ranks itself daily.** The table above is only the seed. Once
+history exists, `social.rank_subreddits` re-derives the order from what each
+source has actually delivered *to us* — no re-probing, the data is already in
+SQLite — and caches it for `rank_refresh_hours` (24h). Ordering is an
+expected-value estimate, not a weighted sum:
+
+```
+expected_new = min(page_size, items_per_hour * collection_cadence_hours)
+usefulness   = mention_rate * breadth * (0.4 + 0.6 * tone)
+value        = expected_new * usefulness
+```
+
+`expected_new` is what matters under a rate limit: a source earns an early slot
+only if it has produced new material since the last pass. That is why
+r/SatoshiStreetBets (0.15 items/hour) sinks despite a decent mention rate, while
+r/Bitcoin (17 items/hour, 35% mentions) leads despite covering only 2 assets.
+Breadth is log-scaled, so single-asset subs still earn a place for per-asset
+sentiment without dominating.
+
+Subreddits with no stats yet are spliced in after the top `probation_after_top`
+(3) rather than appended last — otherwise a rate limit could starve a new source
+forever and it could never earn a rank. See `./collect.py --status`. Two things the measurement settled:
+
+**r/wallstreetbets was dropped.** It measured 0.5% crypto mentions, 1 asset and
+0.00 tone confidence — it is an equities sub, and was half the original config.
+
+**Single-asset subs can't rank.** r/solana's 46.5% mention rate looks excellent,
+but a source that only ever discusses one asset contributes nothing to ordering
+twenty against each other. They are included for per-asset sentiment, not breadth.
+
+**Rate limiting:** Arctic Shift signals it with HTTP **422** (`"Timeout. Maybe
+slow down a bit"`), not 429. The client treats 422 as a rate limit with real
+backoff, and paces `inter_subreddit_delay` between subs — without both, 13 subs
+x 2 calls fails constantly. A full pass takes ~50s.
+
 **Cold start:** velocity needs history. On a fresh database the first run's
 social scores are ~0 by construction — correct behaviour, not a bug. Run the
 collector (below) to build a baseline.
+
+### 2b · StockTwits and Mastodon
+
+Two additional keyless social feeds, both measured before being wired in
+(`cryptoyolo/feeds.py`). Adding them took assets-with-chatter from **10 to 18 of
+20** in a single pass.
+
+| Feed | Yield | Why it earns a slot |
+|---|---|---|
+| **StockTwits** | 600 msgs, 600 mentions | Cashtag streams arrive **pre-attributed to a symbol** — the mention matcher is bypassed entirely, so there are no false positives to control. ~57% carry a **user-declared** Bullish/Bearish label: a stated opinion, not one inferred from a word list. All 20 assets resolve, 30 msgs each. |
+| **Mastodon** | 280 statuses, 304 mentions | Public hashtag timelines, no auth, 300 req/window. |
+
+**Mastodon uses broad tags, not per-asset ones.** Measured: only wide tags are
+alive (#crypto 3.6 posts/h, #bitcoin 3.5/h) while per-asset tags are effectively
+dead — #dot returns one post per 33 hours. Spending a request per asset would
+buy month-old content, so we pull seven broad tags and run the normal extractor.
+
+**Sentiment is de-biased per source, and this matters a lot.** StockTwits users
+self-label ~88% Bullish (mean tone **+0.55**, against Reddit's **+0.05**). Fed in
+raw, that rated 18 of 20 assets strongly bullish — and a signal that calls
+everything a buy cannot *rank* anything. Each source's mean tone is now
+subtracted before assets are compared, so the score measures "bullish relative to
+how bullish that platform always is" — the same relative-to-own-baseline logic
+already used for mention velocity. It compressed ADA from 0.96 to 0.46 and
+restored a usable spread.
+
+Both feeds are individually switchable (`CONFIG.stocktwits.enabled`,
+`CONFIG.mastodon.enabled`), collection is separately gated by
+`pipeline.collect(scrape_feeds=...)`, and a failure in one never blocks the
+others.
+
+**Social alone cannot clear the proposal bar.** With three sources the social
+component reaches ~0.34, which at weight 0.20 contributes ~0.068. The
+`min_composite_score` default is **0.10**, deliberately above that ceiling: no
+trade can be proposed on social sentiment alone — the weakest and most gameable
+of the three families — without corroboration from technicals or a catalyst.
+Lowering it below ~0.07 re-opens that door.
 
 ### 3 · Developer activity and news catalysts
 

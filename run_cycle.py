@@ -72,8 +72,8 @@ def main() -> int:
         store = Store(CONFIG.db_path)
         from cryptoyolo import pipeline
 
-        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        print(f"[{stamp}] starting cycle "
+        started = datetime.now(timezone.utc)
+        print(f"[{started:%Y-%m-%d %H:%M:%S UTC}] starting cycle "
               f"(approve={args.approve}, auto_approve={args.auto_approve})")
 
         result = pipeline.run(
@@ -87,7 +87,11 @@ def main() -> int:
 
         execs = result.get("executions")
         n = 0 if execs is None or execs.empty else len(execs)
-        print(f"[{stamp}] cycle complete — {n} order(s) executed")
+        # Timestamp the END, not a copy of the start - reusing one `stamp` made
+        # every cycle look instantaneous in the logs.
+        done = datetime.now(timezone.utc)
+        print(f"[{done:%Y-%m-%d %H:%M:%S UTC}] cycle complete in "
+              f"{(done - started).total_seconds():.1f}s — {n} order(s) executed")
     return 0
 
 

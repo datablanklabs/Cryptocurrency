@@ -41,7 +41,7 @@ a backstop, since stop, target, trailing and score-reversal usually fire first.
 | Feature | Source | Feeds |
 |---|---|---|
 | **1 · Price & bands** | Binance.US → Coinbase → Kraken → yfinance | technical score |
-| **2 · Reddit sentiment** | r/wallstreetbets, r/cryptocurrency | social score |
+| **2 · Social sentiment** | 13 subreddits + StockTwits + Mastodon | social score |
 | **3 · Dev & news catalysts** | GitHub releases, CoinDesk/Cointelegraph/Decrypt/Defiant | catalyst score |
 
 ---
@@ -100,6 +100,7 @@ pio.renderers.default = "notebook"
 
 from cryptoyolo import charts, engine, indicators, pipeline, prices, scheduler
 from cryptoyolo import catalysts as catalysts_mod
+from cryptoyolo import feeds as feeds_mod
 from cryptoyolo import social as social_mod
 from cryptoyolo.config import CONFIG, TIMEFRAMES, load_dotenv
 from cryptoyolo.store import Store
@@ -158,7 +159,7 @@ CONFIG.risk.max_total_deployed_pct = 60.0     # cap across all proposals
 CONFIG.risk.atr_stop_mult        = 1.5        # stop = 1.5 x daily ATR(14)
 CONFIG.risk.reward_risk_target   = 2.0        # target = 2R
 CONFIG.risk.max_proposals        = 3
-CONFIG.risk.min_composite_score  = 0.05       # 0.0 = always fill all 3 slots
+CONFIG.risk.min_composite_score  = 0.10       # 0.0 = always fill all 3 slots
 
 # ── Exits: when to close an existing position ───────────────────────────
 # Five independent triggers, each switchable. Evaluated every run against live
@@ -422,7 +423,7 @@ charts.grid(CONFIG.symbols[:12], timeframe="1w", cfg=CONFIG, cols=3).show()
 
 md(r"""
 ---
-## Feature 2 · Reddit sentiment & mention velocity
+## Feature 2 · Social sentiment & mention velocity
 
 Pulls posts *and* comments from r/wallstreetbets and r/cryptocurrency, extracts
 asset mentions, scores sentiment with a crypto-native lexicon (`moon`, `rug`,
@@ -457,7 +458,7 @@ run the collector in the next cell for a day to make this feature meaningful.
 code(r"""
 stats = social_mod.scrape(store, CONFIG, verbose=True)
 
-social_scores = social_mod.score_symbols(store, CONFIG)
+social_scores = social_mod.score_symbols(store, CONFIG)   # all sources
 print(f"\nhistory: {social_scores.attrs['history_hours']:.1f}h · "
       f"baseline ready: {social_scores.attrs['baseline_ready']}")
 if not social_scores.attrs["baseline_ready"]:
@@ -465,6 +466,44 @@ if not social_scores.attrs["baseline_ready"]:
           "the collector has run for ~1.5x the velocity window.")
 
 social_scores.head(15)
+"""),
+
+md(r"""
+### StockTwits & Mastodon
+
+Two more keyless feeds, both measured before being wired in. Together they took
+asset coverage from **10 to 18 of 20** in a single pass.
+
+**StockTwits** cashtag streams arrive *pre-attributed to a symbol*, so the
+mention matcher is bypassed entirely — no false positives to control for. About
+57% carry a **user-declared** Bullish/Bearish label: a stated opinion rather than
+one inferred from a word list.
+
+**Mastodon** uses broad hashtags, not per-asset ones. Only wide tags carry
+traffic (#crypto 3.6 posts/h); per-asset tags are effectively dead — #dot
+returns one post per 33 hours — so a request per asset would buy month-old
+content.
+
+**Sentiment is de-biased per source.** StockTwits users self-label ~88% Bullish
+(mean tone +0.55 vs Reddit's +0.05). Raw, that rated 18 of 20 assets strongly
+bullish — and a signal that calls everything a buy cannot *rank* anything. Each
+source's mean tone is subtracted before assets are compared, so what counts is
+being bullish *relative to how bullish that platform always is*.
+"""),
+
+code(r"""
+feed_stats = feeds_mod.scrape(store, CONFIG, verbose=True)
+
+_sql = (
+    "SELECT source, COUNT(*) AS mentions, COUNT(DISTINCT symbol) AS assets, "
+    "ROUND(AVG(sentiment), 3) AS raw_tone "
+    "FROM mentions WHERE created_utc >= strftime('%s','now') - 86400 "
+    "GROUP BY source ORDER BY mentions DESC"
+)
+with store.conn() as _con:
+    by_source = pd.read_sql_query(_sql, _con)
+print("\nlast 24h by source (raw_tone is BEFORE de-biasing):")
+display(by_source)
 """),
 
 code(r"""

@@ -56,6 +56,20 @@ def show_status(store: Store) -> None:
     print(f"velocity ready: {'yes' if ready else 'no'} "
           f"(needs ~{CONFIG.reddit.velocity_window_hours * 1.5:.0f}h)")
 
+    rank = store.source_rank()
+    if not rank.empty:
+        age = store.source_rank_age_hours()
+        print(f"\nsource ranking  (recomputed every {CONFIG.reddit.rank_refresh_hours:.0f}h; "
+              f"age {age:.1f}h)")
+        keys = {s.lower() for s in CONFIG.reddit.subreddits}
+        shown = rank[rank["subreddit"].str.lower().isin(keys)]
+        print(f"  {'#':>2}  {'subreddit':<24}{'value':>8}{'mention%':>10}"
+              f"{'assets':>8}{'tone':>7}{'items/h':>9}")
+        for i, (_, r) in enumerate(shown.iterrows(), 1):
+            print(f"  {i:>2}. {r['subreddit']:<24}{r['value']:>8.3f}"
+                  f"{r['mention_rate']*100:>9.1f}%{int(r['assets']):>8}"
+                  f"{r['tone']:>7.2f}{r['items_per_hour']:>9.2f}")
+
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="crypto-yolo collector")
@@ -87,6 +101,13 @@ def main() -> int:
             print(f"  reddit: {stats}")
         except Exception as exc:  # noqa: BLE001 - never let one source kill the job
             print(f"  ! reddit failed: {exc}")
+
+        from cryptoyolo import feeds
+        try:
+            fstats = feeds.scrape(store, CONFIG, verbose=True)
+            print(f"  feeds: {fstats}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  ! feeds failed: {exc}")
 
         if args.catalysts:
             from cryptoyolo import catalysts
