@@ -2,8 +2,8 @@
 
 Three parts:
 
-  RedditClient    Pulls posts and comments from r/wallstreetbets and
-                  r/cryptocurrency through a ladder of sources: the official
+  RedditClient    Pulls posts and comments from the configured subreddits
+                  (see RedditConfig) through a ladder of sources: the official
                   OAuth API first, then two keyless fallbacks (Arctic Shift and
                   Reddit's own Atom feeds). Reddit 403s anonymous .json now, so
                   without the fallbacks this feature would need credentials to
@@ -22,9 +22,9 @@ Three parts:
                   ranks BTC and ETH first every single time.
 
 A caveat worth keeping in mind while reading the output: subreddit mention
-volume is trivially manipulated, and by the time something trends on r/wsb the
-move that caused the trend has usually already happened. This is why social is
-weighted lowest of the three families by default.
+volume is trivially manipulated, and by the time something trends the move that
+caused the trend has usually already happened. This is why social is weighted
+lowest of the three families by default.
 """
 
 from __future__ import annotations
@@ -257,16 +257,24 @@ class RedditClient:
             print(f"  ! Reddit OAuth failed ({exc}); trying keyless sources")
             return False
 
+    # Arctic Shift signals rate limiting with HTTP 422 and the body
+    # {"error": "Timeout. Maybe slow down a bit"} - NOT 429. Treating that as a
+    # generic error (short backoff, 3 tries) makes it look like the subreddit is
+    # unavailable, which is exactly what happens once the universe grows past a
+    # couple of subs.
+    RATE_LIMIT_CODES = (422, 429, 503)
+
     def _get(self, url: str, params: dict, headers: dict | None = None,
              tries: int | None = None) -> Any:
-        tries = tries or self.cfg.http_retries
+        tries = tries or max(self.cfg.http_retries, 5)
         for attempt in range(tries):
             try:
                 r = self.session.get(url, params=params,
                                      headers=headers or {"User-Agent": self.ua},
                                      timeout=self.cfg.http_timeout)
-                if r.status_code in (429, 503):
-                    time.sleep(3 * (attempt + 1))
+                if r.status_code in self.RATE_LIMIT_CODES:
+                    # Linear-ish backoff; the limiter clears in a few seconds.
+                    time.sleep(3.0 + 2.5 * attempt)
                     continue
                 if r.status_code == 403:
                     raise PermissionError("403")
@@ -275,7 +283,7 @@ class RedditClient:
             except PermissionError:
                 raise
             except Exception:  # noqa: BLE001 - retry, then give up on this source
-                time.sleep(0.6 * (attempt + 1))
+                time.sleep(0.8 * (attempt + 1))
         return None
 
     # -- normalizers --------------------------------------------------------
@@ -283,8 +291,8 @@ class RedditClient:
     def _row(post_id, subreddit, kind, author, created, score, ncomments,
              title, body, permalink) -> dict[str, Any]:
         return {
-            "post_id": post_id, "subreddit": subreddit, "kind": kind,
-            "author": author, "created_utc": float(created or 0),
+            "post_id": post_id, "subreddit": subreddit, "source": "reddit",
+            "kind": kind, "author": author, "created_utc": float(created or 0),
             "score": int(score or 0), "num_comments": int(ncomments or 0),
             "title": title or "", "body": body or "",
             "permalink": permalink or "", "fetched_at": iso(),
@@ -471,6 +479,142 @@ class RedditClient:
 
 
 # --------------------------------------------------------------------------
+# Adaptive source ranking
+# --------------------------------------------------------------------------
+def source_stats(store: Store, cfg: Config = CONFIG,
+                 days: float | None = None,
+                 source: str | None = "reddit") -> pd.DataFrame:
+    """Per-subreddit delivery stats, measured from what we already collected.
+
+    Uses our own tables rather than re-probing the API: the data is free,
+    already fetched, and reflects what each source actually gives *us* under
+    *our* matcher - which is the thing we care about, not its general activity.
+    """
+    days = days or cfg.reddit.rank_window_days
+    cutoff = (utcnow() - timedelta(days=days)).timestamp()
+    # Scope to one platform. Without this the subreddit ranking is computed over
+    # StockTwits cashtags and Mastodon hashtags too - they live in the same
+    # tables now - which pollutes source_rank with ~26 rows that are not
+    # subreddits and can never be fetched as one.
+    where, params = "created_utc >= ?", [cutoff]
+    if source:
+        where += " AND source = ?"
+        params.append(source)
+    with store.conn() as con:
+        posts = pd.read_sql_query(
+            f"SELECT post_id, subreddit, created_utc FROM reddit_posts WHERE {where}",
+            con, params=params)
+        mentions = pd.read_sql_query(
+            f"SELECT post_id, subreddit, symbol, confidence FROM mentions WHERE {where}",
+            con, params=params)
+    if posts.empty:
+        return pd.DataFrame()
+
+    # Reddit subreddit names are case-insensitive, but we store whatever string
+    # was configured - so renaming "cryptocurrency" to "CryptoCurrency" split
+    # that sub's history across two keys and halved its apparent yield. Group on
+    # a folded key so history survives a change of spelling.
+    posts["_key"] = posts["subreddit"].str.lower()
+    if not mentions.empty:
+        mentions["_key"] = mentions["subreddit"].str.lower()
+    else:
+        mentions["_key"] = pd.Series(dtype=str)
+
+    rows = []
+    for key, grp in posts.groupby("_key"):
+        m = mentions[mentions["_key"] == key]
+        sub = key
+        n_items = len(grp)
+        span_h = (grp["created_utc"].max() - grp["created_utc"].min()) / 3600.0
+        rows.append({
+            "subreddit": sub,          # folded key; matched case-insensitively
+            "n_items": n_items,
+            # Items per hour is the honest freshness measure. A sub whose 200
+            # items span 2349h yields <1 new item per 8h cycle - fetching it
+            # costs a request and returns almost nothing.
+            "items_per_hour": n_items / span_h if span_h > 0.5 else float(n_items),
+            "mention_rate": m["post_id"].nunique() / n_items if n_items else 0.0,
+            "assets": int(m["symbol"].nunique()),
+            "tone": float(m["confidence"].mean()) if not m.empty else 0.0,
+        })
+    return pd.DataFrame(rows)
+
+
+def _splice_unranked(ranked: list[str], configured: list[str],
+                     cfg: Config = CONFIG) -> list[str]:
+    """Insert never-yet-collected subreddits just behind the proven leaders.
+
+    Appending them last is self-defeating: under a rate limit the tail may
+    never be reached, so a new source can never gather the stats it needs to
+    earn a ranking - it stays last forever. Splicing after the top few gives it
+    a real chance to prove itself without displacing known-good sources.
+    """
+    unranked = [s for s in configured if s not in set(ranked)]
+    if not unranked:
+        return ranked
+    head = max(1, int(getattr(cfg.reddit, "probation_after_top", 3)))
+    return ranked[:head] + unranked + ranked[head:]
+
+
+def rank_subreddits(store: Store, cfg: Config = CONFIG,
+                    force: bool = False) -> list[str]:
+    """Order subreddits by expected useful mentions per fetch.
+
+    Not an arbitrary weighted sum - an expected-value estimate:
+
+        expected_new = min(page_size, items_per_hour * cadence_hours)
+        usefulness   = mention_rate * breadth * (0.4 + 0.6 * tone)
+        value        = expected_new * usefulness
+
+    `expected_new` is what matters for ordering under a rate limit: a source is
+    only worth an early slot if it has actually produced new material since the
+    last pass. Breadth is log-scaled because a sub covering 10 assets is more
+    useful than one covering 1, but not ten times more - and single-asset subs
+    still earn a place for per-asset sentiment.
+
+    Recomputed at most every `rank_refresh_hours`; falls back to the configured
+    order (the hand-measured one) until enough history exists to beat it.
+    """
+    configured = list(cfg.reddit.subreddits)
+    if not cfg.reddit.adaptive_ranking:
+        return configured
+
+    by_key = {s.lower(): s for s in configured}      # folded -> configured spelling
+
+    age = store.source_rank_age_hours()
+    if not force and age is not None and age < cfg.reddit.rank_refresh_hours:
+        cached = store.source_rank()
+        if not cached.empty:
+            ranked = [by_key[k] for k in cached["subreddit"].str.lower() if k in by_key]
+            return _splice_unranked(ranked, configured, cfg)
+
+    stats = source_stats(store, cfg)
+    if stats.empty or len(stats) < 2:
+        return configured
+
+    page = float(cfg.reddit.posts_per_listing)
+    universe_n = max(len(cfg.symbols), 2)
+    scored = []
+    for _, r in stats.iterrows():
+        expected_new = min(page, r["items_per_hour"] * cfg.reddit.collection_cadence_hours)
+        breadth = math.log1p(r["assets"]) / math.log1p(universe_n)
+        usefulness = r["mention_rate"] * breadth * (0.4 + 0.6 * min(r["tone"], 1.0))
+        scored.append({**r.to_dict(), "value": expected_new * usefulness})
+
+    scored.sort(key=lambda d: -d["value"])
+    store.save_source_rank([
+        {"subreddit": d["subreddit"], "computed_at": iso(), "rank": i,
+         "value": round(d["value"], 5), "mention_rate": round(d["mention_rate"], 5),
+         "assets": int(d["assets"]), "tone": round(d["tone"], 5),
+         "items_per_hour": round(d["items_per_hour"], 4), "n_items": int(d["n_items"])}
+        for i, d in enumerate(scored)
+    ])
+    ranked = [by_key[d["subreddit"].lower()] for d in scored
+              if d["subreddit"].lower() in by_key]
+    return _splice_unranked(ranked, configured, cfg)
+
+
+# --------------------------------------------------------------------------
 # Scrape pipeline
 # --------------------------------------------------------------------------
 def scrape(store: Store, cfg: Config = CONFIG, verbose: bool = True) -> dict[str, int]:
@@ -484,7 +628,12 @@ def scrape(store: Store, cfg: Config = CONFIG, verbose: bool = True) -> dict[str
     rc = cfg.reddit
     all_rows: list[dict] = []
 
-    for sub in rc.subreddits:
+    order = rank_subreddits(store, cfg)
+    if verbose and order != list(rc.subreddits):
+        print(f"  fetch order (adaptive): {', '.join(order[:5])} ...")
+    for sub_idx, sub in enumerate(order):
+        if sub_idx:
+            time.sleep(getattr(rc, "inter_subreddit_delay", 2.5))
         for listing in rc.listings:
             try:
                 rows = client.listing(sub, listing, rc.posts_per_listing)
@@ -548,7 +697,8 @@ def scrape(store: Store, cfg: Config = CONFIG, verbose: bool = True) -> dict[str
             rule_w = {"cashtag": 1.0, "ticker": 0.85, "name": 0.8}[matched_on]
             mentions.append({
                 "post_id": row["post_id"], "symbol": symbol,
-                "subreddit": row["subreddit"], "author": row["author"],
+                "subreddit": row["subreddit"], "source": "reddit",
+                "author": row["author"],
                 "created_utc": row["created_utc"], "sentiment": pol,
                 "confidence": conf,
                 "weight": round((1.0 + engagement) * kind_w * rule_w, 4),
@@ -582,7 +732,25 @@ def score_symbols(store: Store, cfg: Config = CONFIG) -> pd.DataFrame:
     baseline_start = now - timedelta(days=rc.baseline_days)
 
     hist = store.mentions_since(baseline_start)
-    span_hours = store.history_span_hours()
+    # Measure over the SAME window the baseline uses, or the two silently
+    # disagree the moment baseline_days is changed from its default.
+    span_hours = store.history_span_hours(within_days=rc.baseline_days)
+
+    # Per-source mean tone across ALL assets in the window. Subtracting it makes
+    # the score measure deviation from a platform's norm rather than its
+    # absolute cheerfulness.
+    source_bias: dict[str, float] = {}
+    if not hist.empty and "source" in hist.columns:
+        grouped = hist.groupby("source")["sentiment"]
+        min_n = getattr(rc, "min_samples_for_debias", 30)
+        for src, series in grouped:
+            n = len(series)
+            # Shrink the correction toward zero on thin samples: with a handful
+            # of mentions the "platform mean" is mostly noise, and subtracting
+            # noise is worse than subtracting nothing.
+            shrink = min(1.0, n / float(min_n)) if min_n else 1.0
+            source_bias[src] = float(series.mean()) * shrink
+
     rows = []
 
     for symbol in cfg.symbols:
@@ -609,7 +777,15 @@ def score_symbols(store: Store, cfg: Config = CONFIG) -> pd.DataFrame:
 
         if n_recent:
             w = recent["weight"].to_numpy()
-            s = recent["sentiment"].to_numpy()
+            # Centre sentiment on each SOURCE's own baseline before comparing
+            # assets. StockTwits users self-label ~88% Bullish (mean +0.55 vs
+            # Reddit's +0.05), so raw tone made 18 of 20 assets look strongly
+            # positive - a signal that rates everything a buy cannot rank
+            # anything. What carries information is being bullish *relative to
+            # how bullish that platform always is*, the same relative-to-own-
+            # baseline logic already used for mention velocity.
+            s = (recent["sentiment"] - recent["source"].map(source_bias).fillna(0.0)
+                 ).clip(-1.0, 1.0).to_numpy()
             c = recent["confidence"].to_numpy()
             eff = w * c                        # opinion-free posts barely count
             avg_sent = float((s * eff).sum() / eff.sum()) if eff.sum() > 0 else 0.0

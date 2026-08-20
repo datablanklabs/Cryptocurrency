@@ -158,7 +158,7 @@ class RiskConfig:
     # 0.0 to always surface a full slate of `max_proposals`. It is deliberately
     # not 0 by default: on a genuinely directionless day the honest output is
     # one candidate, or none, rather than three manufactured ones.
-    min_composite_score: float = 0.05
+    min_composite_score: float = 0.10
     # Exits are proposed and executed before entries, so their proceeds are
     # spendable by the buys in the same run. That projection is discounted by
     # this much to absorb slippage and fees - the sale rarely nets exactly the
@@ -224,14 +224,96 @@ class RedditConfig:
     #   rss         Reddit's own Atom feeds - works keyless, but NO scores
     #   public_json legacy anonymous .json - usually 403, kept as a last resort
     sources: tuple[str, ...] = ("oauth", "arctic", "rss", "public_json")
-    subreddits: tuple[str, ...] = ("wallstreetbets", "cryptocurrency")
+    # All 14 candidates measured 2026-08-20 against Arctic Shift (200 items
+    # each). Ordered best-first by mention-rate x asset-breadth x tone, so if a
+    # run is cut short by rate limits the most informative sources are already
+    # collected. Measured stats are in the README table.
+    #
+    # One carries a known caveat, kept because breadth was requested:
+    # r/CryptoMoonShots is a pump-promotion venue (high volume, low information).
+    # Watch whether it degrades the social score.
+    # r/wallstreetbets was measured and dropped: 0.5% crypto mentions, 1 asset,
+    # 0.00 tone confidence - it is an equities sub, not a crypto one.
+    subreddits: tuple[str, ...] = (
+        "CryptoMarkets",          # 18.5% mentions, 7 assets, tone 0.20
+        "CryptoCurrency",         # 11.5%, 6 assets, tone 0.25 - freshest (13h/200)
+        "ethtrader",              # 33.0%, 4 assets - ETH-dominated
+        "Bitcoin",                # 29.0%, 2 assets - single-asset
+        "defi",                   # 13.0%, 5 assets
+        "SatoshiStreetBets",      # 12.5%, 8 assets - low activity (2349h/200)
+        "solana",                 # 46.5%, 4 assets - single-asset
+        "CryptoMoonShots",        #  9.0%, 4 assets - pump-shill venue
+        "altcoin",                # 12.5%, 10 assets - best breadth, low activity
+        "BitcoinMarkets",         # 19.0%, 2 assets
+        "CryptoCurrencyTrading",  #  4.5%, 3 assets
+        "CryptoTechnology",       #  8.0%, 3 assets
+        "binance",                #  5.0%, 4 assets
+    )
+    # Seconds to wait between subreddits. The keyless sources are shared public
+    # services; 14 subs x 2 calls per cycle will trip Arctic Shift's limiter
+    # without pacing.
+    inter_subreddit_delay: float = 2.5
+
+    # Adaptive fetch order. Subreddits are re-ranked from what they have
+    # actually delivered (see social.rank_subreddits) so the highest-yield
+    # sources are fetched before a rate limiter can cut the pass short.
+    adaptive_ranking: bool = True
+    rank_refresh_hours: float = 24.0    # recompute once a day
+    rank_window_days: float = 7.0       # look back this far when measuring
+    collection_cadence_hours: float = 8.0   # matches the launchd schedule
+    # Where to slot a subreddit that has no stats yet: after this many proven
+    # leaders. Appending new sources last means a rate limit can starve them
+    # forever, so they could never earn a rank.
+    probation_after_top: int = 3
     listings: tuple[str, ...] = ("new", "hot")
     posts_per_listing: int = 100
     include_comments: bool = True
     comments_per_post: int = 40
     max_posts_for_comments: int = 15
     baseline_days: int = 7        # window used to compute the "normal" mention rate
+    # Below this many mentions, a source's measured tone bias is mostly noise,
+    # so the de-biasing correction is shrunk toward zero.
+    min_samples_for_debias: int = 30
     velocity_window_hours: int = 24
+
+
+@dataclass
+class StockTwitsConfig:
+    """StockTwits cashtag streams — https://api.stocktwits.com/api/2 (no key).
+
+    The most information-dense social source measured: every message arrives
+    already attributed to one symbol, so the mention matcher is bypassed
+    entirely and there are no false positives to control for. Better still,
+    ~63% carry a user-declared Bullish/Bearish label, which is a stated opinion
+    rather than one inferred from a word list.
+    """
+    enabled: bool = True
+    symbol_suffix: str = ".X"          # crypto namespace: BTC.X, ETH.X, ...
+    request_delay: float = 1.2         # unauthenticated; no advertised limit
+    # Request budget: one call per symbol. 0 = no cap (follow the universe).
+    # A fixed number equal to the universe size silently drops any asset added
+    # later, so this defaults to uncapped.
+    max_symbols: int = 0
+    # A user-declared label is far stronger evidence than lexicon inference.
+    label_confidence: float = 0.9
+
+
+@dataclass
+class MastodonConfig:
+    """Mastodon public hashtag timelines (no auth, 300 req/window).
+
+    Measured 2026-08-20: only BROAD tags carry real traffic (#crypto 3.6
+    posts/h, #bitcoin 3.5/h) while per-asset tags are effectively dead (#dot is
+    one post per 33 hours). So we pull a few wide tags and run the normal
+    extractor over them, rather than spending a request per asset on tags that
+    return month-old content.
+    """
+    enabled: bool = True
+    instance: str = "https://mastodon.social"
+    hashtags: tuple[str, ...] = ("crypto", "bitcoin", "btc", "cryptocurrency",
+                                 "ethereum", "defi", "altcoin")
+    limit: int = 40
+    request_delay: float = 0.8
 
 
 @dataclass
@@ -346,6 +428,8 @@ class Config:
     risk: RiskConfig = field(default_factory=RiskConfig)
     exits: ExitConfig = field(default_factory=ExitConfig)
     reddit: RedditConfig = field(default_factory=RedditConfig)
+    stocktwits: StockTwitsConfig = field(default_factory=StockTwitsConfig)
+    mastodon: MastodonConfig = field(default_factory=MastodonConfig)
     catalysts: CatalystConfig = field(default_factory=CatalystConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
 

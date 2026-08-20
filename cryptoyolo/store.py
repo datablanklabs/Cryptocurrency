@@ -30,9 +30,13 @@ CREATE TABLE IF NOT EXISTS runs (
     notes       TEXT
 );
 
+-- Historically Reddit-only; the name is kept to avoid migrating live data.
+-- `source` distinguishes platforms and `subreddit` holds the channel within it
+-- (subreddit name, StockTwits cashtag, or Mastodon hashtag).
 CREATE TABLE IF NOT EXISTS reddit_posts (
     post_id     TEXT PRIMARY KEY,
     subreddit   TEXT NOT NULL,
+    source      TEXT NOT NULL DEFAULT 'reddit',
     kind        TEXT NOT NULL,          -- 'post' | 'comment'
     author      TEXT,
     created_utc REAL NOT NULL,
@@ -51,6 +55,7 @@ CREATE TABLE IF NOT EXISTS mentions (
     post_id      TEXT NOT NULL,
     symbol       TEXT NOT NULL,
     subreddit    TEXT NOT NULL,
+    source       TEXT NOT NULL DEFAULT 'reddit',
     author       TEXT,
     created_utc  REAL NOT NULL,
     sentiment    REAL NOT NULL,
@@ -175,6 +180,21 @@ CREATE TABLE IF NOT EXISTS protective_orders (
     response     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_protective_symbol ON protective_orders(symbol, status);
+
+-- Daily-refreshed fetch order for subreddits, derived from what each one has
+-- actually delivered (see social.rank_subreddits). Cached because recomputing
+-- it every collection would be wasted work and would make the order jitter.
+CREATE TABLE IF NOT EXISTS source_rank (
+    subreddit      TEXT PRIMARY KEY,
+    computed_at    TEXT NOT NULL,
+    rank           INTEGER,
+    value          REAL,
+    mention_rate   REAL,
+    assets         INTEGER,
+    tone           REAL,
+    items_per_hour REAL,
+    n_items        INTEGER
+);
 """
 
 
@@ -221,9 +241,22 @@ class Store:
         finally:
             con.close()
 
+    def _migrate(self, con: sqlite3.Connection) -> None:
+        """Additive migrations for databases created before a column existed.
+
+        SQLite ALTER TABLE ADD COLUMN is cheap and non-destructive, so existing
+        rows keep their data and default to 'reddit' - which is what they are.
+        """
+        for table in ("reddit_posts", "mentions"):
+            cols = {r["name"] for r in con.execute(f"PRAGMA table_info({table})")}
+            if "source" not in cols:
+                con.execute(
+                    f"ALTER TABLE {table} ADD COLUMN source TEXT NOT NULL DEFAULT 'reddit'")
+
     def _init_schema(self) -> None:
         with self.conn() as con:
             con.executescript(SCHEMA)
+            self._migrate(con)
             con.execute(
                 "INSERT OR IGNORE INTO paper_cash(id, balance) VALUES (1, ?)", (10_000.0,)
             )
@@ -248,9 +281,9 @@ class Store:
         with self.conn() as con:
             cur = con.executemany(
                 """INSERT INTO reddit_posts
-                   (post_id, subreddit, kind, author, created_utc, score,
+                   (post_id, subreddit, source, kind, author, created_utc, score,
                     num_comments, title, body, permalink, fetched_at)
-                   VALUES (:post_id,:subreddit,:kind,:author,:created_utc,:score,
+                   VALUES (:post_id,:subreddit,:source,:kind,:author,:created_utc,:score,
                            :num_comments,:title,:body,:permalink,:fetched_at)
                    ON CONFLICT(post_id) DO UPDATE SET
                      score=excluded.score,
@@ -267,9 +300,9 @@ class Store:
         with self.conn() as con:
             cur = con.executemany(
                 """INSERT INTO mentions
-                   (post_id, symbol, subreddit, author, created_utc,
+                   (post_id, symbol, subreddit, source, author, created_utc,
                     sentiment, confidence, weight, matched_on)
-                   VALUES (:post_id,:symbol,:subreddit,:author,:created_utc,
+                   VALUES (:post_id,:symbol,:subreddit,:source,:author,:created_utc,
                            :sentiment,:confidence,:weight,:matched_on)
                    ON CONFLICT(post_id, symbol) DO UPDATE SET
                      sentiment=excluded.sentiment,
@@ -296,13 +329,28 @@ class Store:
             ).fetchone()
         return int(row["n"])
 
-    def history_span_hours(self) -> float:
-        """How much Reddit history we've accumulated. Velocity is meaningless
-        until this is comfortably larger than the velocity window."""
+    def history_span_hours(self, within_days: float = 7.0) -> float:
+        """Hours of RECENT Reddit history, measured inside the baseline window.
+
+        Deliberately not the span of the whole table. Low-activity subreddits
+        return months-old posts in their first page, so a total-span measure
+        jumps to ~94 days after one collection and reports "velocity ready" on
+        what is effectively a cold database. Velocity only ever looks back
+        `baseline_days`, so readiness has to be measured over the same window.
+
+        Pass within_days=0 for the raw span of everything stored.
+        """
         with self.conn() as con:
-            row = con.execute(
-                "SELECT MIN(created_utc) AS lo, MAX(created_utc) AS hi FROM reddit_posts"
-            ).fetchone()
+            if within_days and within_days > 0:
+                cutoff = (utcnow() - timedelta(days=within_days)).timestamp()
+                row = con.execute(
+                    "SELECT MIN(created_utc) AS lo, MAX(created_utc) AS hi "
+                    "FROM reddit_posts WHERE created_utc >= ?", (cutoff,),
+                ).fetchone()
+            else:
+                row = con.execute(
+                    "SELECT MIN(created_utc) AS lo, MAX(created_utc) AS hi FROM reddit_posts"
+                ).fetchone()
         if not row or row["lo"] is None:
             return 0.0
         return (row["hi"] - row["lo"]) / 3600.0
@@ -476,6 +524,41 @@ class Store:
     def delete_position_meta(self, symbol: str) -> None:
         with self.conn() as con:
             con.execute("DELETE FROM position_meta WHERE symbol=?", (symbol,))
+
+    # -- source ranking -----------------------------------------------------
+    def save_source_rank(self, rows: Iterable[dict[str, Any]]) -> None:
+        rows = list(rows)
+        if not rows:
+            return
+        with self.conn() as con:
+            con.execute("DELETE FROM source_rank")
+            con.executemany(
+                """INSERT INTO source_rank
+                   (subreddit, computed_at, rank, value, mention_rate, assets,
+                    tone, items_per_hour, n_items)
+                   VALUES (:subreddit,:computed_at,:rank,:value,:mention_rate,
+                           :assets,:tone,:items_per_hour,:n_items)""",
+                rows,
+            )
+
+    def source_rank(self) -> pd.DataFrame:
+        with self.conn() as con:
+            return pd.read_sql_query(
+                "SELECT * FROM source_rank ORDER BY rank ASC", con)
+
+    def source_rank_age_hours(self) -> float | None:
+        """Hours since the ranking was last computed, or None if never."""
+        with self.conn() as con:
+            row = con.execute("SELECT MAX(computed_at) AS t FROM source_rank").fetchone()
+        if not row or not row["t"]:
+            return None
+        try:
+            ts = datetime.fromisoformat(row["t"])
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            return (utcnow() - ts).total_seconds() / 3600.0
+        except Exception:  # noqa: BLE001 - unparseable = treat as stale
+            return None
 
     # -- protective orders --------------------------------------------------
     def save_protective_order(self, row: dict[str, Any]) -> None:

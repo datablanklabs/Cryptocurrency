@@ -12,7 +12,7 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from . import approval, broker as broker_mod, catalysts, engine, exits, social
+from . import approval, broker as broker_mod, catalysts, engine, exits, feeds, social
 from .config import CONFIG, Config, credential_status, load_dotenv
 from .store import Store, iso, utcnow
 
@@ -22,8 +22,17 @@ def new_run_id() -> str:
 
 
 def collect(store: Store, cfg: Config = CONFIG, scrape_reddit: bool = True,
-            scan_catalysts: bool = True, verbose: bool = True) -> dict[str, Any]:
-    """Refresh the social and catalyst data feeding the engine."""
+            scan_catalysts: bool = True, verbose: bool = True,
+            scrape_feeds: bool | None = None) -> dict[str, Any]:
+    """Refresh the social and catalyst data feeding the engine.
+
+    `scrape_feeds` (StockTwits + Mastodon) defaults to whatever `scrape_reddit`
+    is, preserving existing behaviour, but is separable: previously they were
+    nested under the Reddit flag, so `scrape_reddit=False` silently disabled two
+    unrelated platforms.
+    """
+    if scrape_feeds is None:
+        scrape_feeds = scrape_reddit
     stats: dict[str, Any] = {}
     if scrape_reddit:
         if verbose:
@@ -33,6 +42,15 @@ def collect(store: Store, cfg: Config = CONFIG, scrape_reddit: bool = True,
         except Exception as exc:  # noqa: BLE001 - engine still runs without social
             print(f"  ! Reddit collection failed: {exc}")
             stats["reddit"] = {"posts": 0, "mentions": 0, "error": str(exc)}
+
+    if scrape_feeds:
+        if verbose:
+            print("\n[1b] StockTwits + Mastodon")
+        try:
+            stats["feeds"] = feeds.scrape(store, cfg, verbose)
+        except Exception as exc:  # noqa: BLE001 - engine still runs without them
+            print(f"  ! Extra feeds failed: {exc}")
+            stats["feeds"] = {}
 
     if scan_catalysts:
         if verbose:
