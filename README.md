@@ -2,9 +2,10 @@
 
 A Jupyter dashboard that pulls crypto price data, Reddit sentiment, and
 developer/news catalysts; scores the universe with a transparent formula;
-proposes up to three ranked trade candidates for a 1-day-to-1-week horizon;
-asks for per-trade approval; and executes approved trades through the Binance
-API.
+proposes up to three ranked trade candidates on short-horizon signals (held up
+to `exits.horizon_days`, default 30);
+asks for per-trade approval (or `--auto-approve`, opt-in); and executes approved
+trades through the Binance API.
 
 ```bash
 jupyter lab crypto_yolo_dashboard.ipynb
@@ -49,6 +50,7 @@ This is not financial advice. You approve every trade; you own every outcome.
 crypto_yolo_dashboard.ipynb   the dashboard (generated — edit build_notebook.py)
 build_notebook.py             regenerates the notebook
 collect.py                    scheduled collector entry point (path-independent)
+run_cycle.py                  one trading cycle from the CLI (--auto-approve lives here)
 com.crypto-yolo.collector.plist   launchd job, runs collect.py every 8h
 cryptoyolo/
   config.py       universe, weights, risk, execution settings, env loading
@@ -169,7 +171,7 @@ candidate — which it rarely does, so it just sits there.
 | Stop hit | price ≤ the stop set at entry | `stop_loss` |
 | Target hit | price ≥ the target set at entry | `take_profit`, `take_profit_fraction` |
 | Trailing stop | gave back > `trail_pct` from the high-water mark | `trailing_stop`, `trail_pct`, `trail_activate_pct` |
-| Horizon expiry | held past the 1–7 day thesis | `horizon_expiry`, `horizon_days` |
+| Horizon expiry | held past `horizon_days` (default 30) | `horizon_expiry`, `horizon_days` |
 | Score reversal | composite ≤ threshold | `score_reversal`, `score_reversal_threshold` |
 
 Each is independently switchable; `CONFIG.exits.enabled = False` turns the whole
@@ -312,6 +314,45 @@ SELLs are exempt from both caps — an exit releases capital rather than consumi
 it — and are separately capped at the quantity you actually hold.
 
 ---
+
+## Running a cycle from the CLI
+
+```bash
+./run_cycle.py                  # propose only — executes nothing (default)
+./run_cycle.py --approve        # prompt per trade, same as the notebook
+./run_cycle.py --auto-approve   # accept every proposal, no prompting
+./run_cycle.py --auto-approve --collect --paper
+```
+
+With no flags it prints the slate and exits, so running it by accident cannot
+trade. An `flock` guard prevents overlapping cycles.
+
+### --auto-approve
+
+Off by default, and it takes a deliberate flag or `CONFIG.execution.auto_approve
+= True`. It removes the human from the loop, so what it means depends entirely
+on the mode:
+
+| Mode | Effect |
+|---|---|
+| paper | simulated fills, unattended. The intended use — builds a decision record you can score the engine against |
+| binance + `dry_run=True` | orders validated against Binance filters, never filled |
+| binance live | **unattended real-money trading** — requires `CRYPTO_YOLO_ALLOW_AUTO_LIVE=1` |
+
+That last row is a third switch on top of the two that already gate live mode.
+Without it, auto-approve **refuses and approves nothing** rather than quietly
+falling back to prompting — a cron job has nobody to prompt, and silently
+skipping execution would be just as surprising as silently trading.
+
+Auto-approved trades are recorded as `auto-approved`, not `approved`, so the
+audit trail always distinguishes a machine decision from yours. That distinction
+is the point: it lets you ask later whether the engine's unattended picks
+actually performed, separately from the ones you chose.
+
+A caveat worth stating plainly: the scoring weights have never been fitted to
+realised returns, so auto-approving into a live account is betting real money on
+untested heuristics with nobody watching. Paper mode exists precisely so you can
+gather that evidence first.
 
 ## Running the collector on a schedule
 

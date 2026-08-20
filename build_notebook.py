@@ -30,9 +30,13 @@ md(r"""
 # crypto-yolo — trading dashboard
 
 Run all cells. The notebook refreshes three feature families, scores the
-universe, proposes up to **3 ranked trade candidates** for a 1-day-to-1-week
-horizon, asks you to approve each one, and executes the approved ones through
-the Binance API.
+universe, proposes up to **3 ranked trade candidates**, asks you to approve each
+one (auto-approval is opt-in, never the default), and executes the approved ones
+through the Binance API.
+
+Signals are short-horizon (1d/1w technicals, ~5-day news lookback). How long a
+position may be *held* is separate: `CONFIG.exits.horizon_days`, default 30 —
+a backstop, since stop, target, trailing and score-reversal usually fire first.
 
 | Feature | Source | Feeds |
 |---|---|---|
@@ -167,8 +171,8 @@ CONFIG.exits.take_profit_fraction     = 100.0   # % of position to sell on a tar
 CONFIG.exits.trailing_stop            = True
 CONFIG.exits.trail_pct                = 8.0     # max giveback from the high-water mark
 CONFIG.exits.trail_activate_pct       = 3.0     # only arm once this far in profit
-CONFIG.exits.horizon_expiry           = True    # the 1–7d thesis ran out of time
-CONFIG.exits.horizon_days             = 7.0
+CONFIG.exits.horizon_expiry           = True    # the trade thesis ran out of time
+CONFIG.exits.horizon_days             = 30.0
 CONFIG.exits.score_reversal           = True    # the thesis inverted
 CONFIG.exits.score_reversal_threshold = -0.15
 CONFIG.exits.max_exit_proposals       = 3       # exits get their OWN slots
@@ -592,6 +596,9 @@ result = pipeline.run(
     scrape_reddit=False,     # already scraped above; set True for a fully self-contained run
     scan_catalysts=False,    # ditto
     interactive=True,        # False = show proposals, execute nothing
+    # auto_approve=True,     # accept everything without prompting — NOT the default.
+    #                        # Live accounts additionally need CRYPTO_YOLO_ALLOW_AUTO_LIVE=1.
+    #                        # Same thing from a shell: ./run_cycle.py --auto-approve
 )
 
 # An empty slate is a normal outcome, so guard before subscripting columns —
