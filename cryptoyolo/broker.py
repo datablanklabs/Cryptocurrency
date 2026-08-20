@@ -488,6 +488,14 @@ class BinanceBroker:
         ex = self.cfg.execution
         if not (ex.place_stop_orders or ex.place_limit_orders):
             return None
+        if not ex.place_stop_limit_orders and ex.place_stop_orders:
+            # The flag exists so the intent is explicit, but the venue decides.
+            # Binance.US lists no market STOP_LOSS, so a plain stop is not
+            # available - say so rather than silently substituting.
+            print("    ⚠ place_stop_limit_orders=False requests a market STOP_LOSS, "
+                  "which Binance.US does not support (orderTypes: LIMIT, "
+                  "LIMIT_MAKER, MARKET, STOP_LOSS_LIMIT, TAKE_PROFIT_LIMIT). "
+                  "Using STOP_LOSS_LIMIT instead.")
         symbol = proposal["symbol"]
         pair = self.pair(symbol)
         qty_raw = float(record.get("qty") or proposal["qty"])

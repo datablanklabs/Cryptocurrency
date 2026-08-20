@@ -47,7 +47,8 @@ def collect(store: Store, cfg: Config = CONFIG, scrape_reddit: bool = True,
 
 def run(store: Store, cfg: Config = CONFIG, scrape_reddit: bool = True,
         scan_catalysts: bool = True, interactive: bool = True,
-        input_fn: Callable[[str], str] | None = None) -> dict[str, Any]:
+        input_fn: Callable[[str], str] | None = None,
+        auto_approve: bool | None = None) -> dict[str, Any]:
     """Full cycle. Returns every intermediate artifact for inspection."""
     run_id = new_run_id()
     store.start_run(run_id, cfg.execution.mode)
@@ -117,7 +118,9 @@ def run(store: Store, cfg: Config = CONFIG, scrape_reddit: bool = True,
     preflight = {p["proposal_id"]: broker.preflight(p.to_dict())
                  for _, p in proposals.iterrows()}
 
-    if not interactive:
+    if auto_approve is None:
+        auto_approve = cfg.execution.auto_approve
+    if not interactive and not auto_approve:
         print(engine.format_proposals(proposals))
         print("\n[non-interactive] no approval requested; nothing executed.")
         store.finish_run(run_id)
@@ -126,7 +129,8 @@ def run(store: Store, cfg: Config = CONFIG, scrape_reddit: bool = True,
                 "preflight": preflight, "holdings": holdings, "cash": cash,
                 "exit_signals": exit_signals}
 
-    reviewed = approval.request_approval(proposals, cfg, input_fn, preflight)
+    reviewed = approval.request_approval(proposals, cfg, input_fn, preflight,
+                                         auto_approve=auto_approve)
 
     print("\n[execution]")
     executions = approval.execute_approved(reviewed, broker, store, run_id, cfg)
@@ -145,11 +149,13 @@ def status(cfg: Config = CONFIG) -> pd.DataFrame:
         ("Binance API keys", creds["binance"],
          "trade execution + best price granularity"),
         ("Reddit OAuth", creds["reddit_oauth"],
-         "required — Reddit returns 403 to anonymous clients"),
+         "optional — keyless fallbacks (Arctic Shift, Atom feeds) cover it"),
         ("GitHub token", creds["github"],
          "optional — raises rate limit from 60/hr to 5000/hr"),
         ("CRYPTO_YOLO_ALLOW_LIVE", creds["live_trading_env"],
          "second switch required for real orders"),
+        ("CRYPTO_YOLO_ALLOW_AUTO_LIVE", creds["auto_live_env"],
+         "third switch — only for auto-approve against a live account"),
     ]
     return pd.DataFrame(
         [{"integration": n, "configured": "yes" if ok else "no", "why": why}

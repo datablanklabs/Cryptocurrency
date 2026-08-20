@@ -1,11 +1,15 @@
-"""Human approval gate.
+"""Approval gate.
 
-Nothing is ever executed without an explicit per-trade answer typed here. There
-is no "approve everything by default" path and no timeout that proceeds on
-silence — an empty answer is a rejection.
-
-In live mode the prompt escalates: you must type the symbol back, so muscle
+By default nothing executes without an explicit per-trade answer typed here: an
+empty answer is a rejection, and there is no timeout that proceeds on silence.
+In live mode the prompt escalates - you must type the symbol back, so muscle
 memory on the `y` key cannot spend real money.
+
+`auto_approve` (opt-in, never the default) skips the prompt entirely and accepts
+everything. Those decisions are recorded as `auto-approved` rather than
+`approved` so the audit trail always separates machine choices from yours, and
+combining it with a live account additionally requires
+CRYPTO_YOLO_ALLOW_AUTO_LIVE=1.
 """
 
 from __future__ import annotations
@@ -22,6 +26,8 @@ from .store import Store, iso
 
 APPROVE = {"y", "yes", "a", "approve"}
 REJECT = {"n", "no", "r", "reject", ""}
+# Both count as approved for execution, but stay distinct in the audit trail.
+APPROVED_STATES = {"approved", "auto-approved"}
 
 
 class NoStdin(RuntimeError):
@@ -43,15 +49,33 @@ def _default_input(prompt: str) -> str:
 
 def request_approval(proposals: pd.DataFrame, cfg: Config = CONFIG,
                      input_fn: Callable[[str], str] | None = None,
-                     preflight: dict[str, list[str]] | None = None) -> pd.DataFrame:
+                     preflight: dict[str, list[str]] | None = None,
+                     auto_approve: bool | None = None) -> pd.DataFrame:
     """Prompt for each proposal. Returns the frame with a `decision` column set.
 
     Answers: y/yes to approve, n/no/Enter to reject, `q` to stop reviewing and
     reject everything remaining.
+
+    `auto_approve` (default False, or CONFIG.execution.auto_approve) accepts
+    every proposal without prompting. Decisions are recorded as `auto-approved`
+    rather than `approved`, so the audit trail always distinguishes a machine
+    decision from a human one - which matters when you later ask whether the
+    engine is actually any good.
+
+    Auto-approving into a LIVE account is unattended real-money trading and
+    needs a third switch, CRYPTO_YOLO_ALLOW_AUTO_LIVE=1, on top of the two that
+    already gate live mode. Without it, auto-approve refuses rather than
+    quietly falling back to prompting (a cron job has no one to prompt).
     """
     ask = input_fn or _default_input
     if proposals.empty:
         return proposals
+
+    if auto_approve is None:
+        auto_approve = cfg.execution.auto_approve
+
+    if auto_approve:
+        return _auto_approve(proposals, cfg, preflight)
 
     banner = execution_banner(cfg)
     live = cfg.execution.live_enabled
@@ -136,6 +160,38 @@ def request_approval(proposals: pd.DataFrame, cfg: Config = CONFIG,
     return out
 
 
+def _auto_approve(proposals: pd.DataFrame, cfg: Config = CONFIG,
+                  preflight: dict[str, list[str]] | None = None) -> pd.DataFrame:
+    """Accept every proposal, with no prompt. Never the default."""
+    rule = "═" * 78
+    out = proposals.copy()
+    print(f"\n{rule}\n{execution_banner(cfg)}")
+
+    if cfg.execution.live_enabled and not cfg.execution.auto_live_enabled:
+        print("AUTO-APPROVE REFUSED — live mode without CRYPTO_YOLO_ALLOW_AUTO_LIVE=1.\n"
+              "Unattended real-money trading needs that switch set explicitly.\n"
+              "Nothing was approved; run interactively, or set the variable.")
+        print(rule)
+        out["decision"] = "rejected"
+        return out
+
+    label = ("*** AUTO-APPROVING LIVE ORDERS — REAL MONEY, NO PROMPT ***"
+             if cfg.execution.auto_live_enabled
+             else "AUTO-APPROVE — accepting all proposals without prompting")
+    print(f"{label}\n{rule}")
+
+    for _, p in proposals.iterrows():
+        kind = f"EXIT [{p['trigger']}]" if p.get("kind") == "exit" else p["side"]
+        print(f"  ✓ auto-approved  #{p['rank']} {kind:<22} {p['symbol']:<6} "
+              f"qty {fmt_qty(p['qty']):>18}  ≈ ${p['notional']:,.2f}")
+        for w in (preflight or {}).get(p["proposal_id"], []):
+            print(f"      ⚠ {w}")
+
+    out["decision"] = "auto-approved"
+    print(f"\n{rule}\n{len(out)} of {len(out)} auto-approved.\n{rule}")
+    return out
+
+
 def _sync_position_meta(proposal, record: dict, broker, store: Store,
                         cfg: Config = CONFIG) -> None:
     """Give a filled position the memory its exits depend on.
@@ -170,6 +226,10 @@ def _sync_position_meta(proposal, record: dict, broker, store: Store,
         return
     if remaining <= 1e-9:
         store.delete_position_meta(symbol)
+    elif str(proposal.get("trigger", "")) == "target hit":
+        # A partial take-profit that leaves a remainder: retire the target so
+        # it cannot fire again next run and halve the position repeatedly.
+        store.clear_position_target(symbol)
 
 
 def execute_approved(proposals: pd.DataFrame, broker, store: Store, run_id: str,
@@ -181,7 +241,7 @@ def execute_approved(proposals: pd.DataFrame, broker, store: Store, run_id: str,
     results: list[dict[str, Any]] = []
     for _, p in proposals.iterrows():
         store.set_decision(p["proposal_id"], p["decision"])
-        if p["decision"] != "approved":
+        if p["decision"] not in APPROVED_STATES:
             continue
         # Resting protective orders lock the base asset, so they must be
         # cancelled BEFORE a sell or the order fails on free balance.

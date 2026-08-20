@@ -73,7 +73,12 @@ def technical_score(short: dict[str, float], medium: dict[str, float]) -> tuple[
     # means something very different for BTC than for SHIB.
     trend = _clip(0.6 * _squash(dist20 / atr_pct, 3.0) + 0.4 * _squash(dist50 / atr_pct, 5.0))
 
-    mom_short = _squash(short.get("macd_hist", 0.0) / (short.get("close", 1.0) * atr_pct), 0.8)
+    # Normalise each timeframe by ITS OWN volatility. Using the medium frame's
+    # atr_pct for both divided the short-frame MACD by a number roughly 3x too
+    # large, so the 0.45 weight on short momentum was really contributing about
+    # 0.14 - the short frame was nearly muted without saying so.
+    atr_pct_short = max(short.get("atr_pct", atr_pct), 1e-6)
+    mom_short = _squash(short.get("macd_hist", 0.0) / (short.get("close", 1.0) * atr_pct_short), 0.8)
     mom_med = _squash(medium.get("macd_hist", 0.0) / (medium.get("close", 1.0) * atr_pct), 0.8)
     momentum = _clip(0.45 * mom_short + 0.55 * mom_med)
 
@@ -132,7 +137,7 @@ def build_scores(store: Store, cfg: Config = CONFIG, verbose: bool = True,
             short_raw, _ = prices.get_ohlcv(symbol, "1d", cfg)
             med_raw, _ = prices.get_ohlcv(symbol, "1w", cfg)
             # Daily candles. Needed for stop sizing: ATR on the 1w view is the
-            # range of a *1-hour* bar, which for a 1-7 day hold produces stops
+            # range of a *1-hour* bar, which for a multi-day hold produces stops
             # under 1% that get taken out by ordinary intraday noise.
             long_raw, _ = prices.get_ohlcv(symbol, "1y", cfg)
         except Exception as exc:  # noqa: BLE001 - drop the asset, note why
@@ -368,9 +373,9 @@ def propose(scores: pd.DataFrame, store: Store, run_id: str, cfg: Config = CONFI
             continue        # bearish with no position: spot can't short — skip
 
         entry = float(row["price"])
-        # Stop distance is scaled to DAILY volatility, matching the 1-7 day
-        # horizon. The floor keeps a freakishly quiet asset from producing a
-        # stop so tight that position size explodes.
+        # Stop distance is scaled to DAILY volatility, matching a multi-day
+        # holding horizon. The floor keeps a freakishly quiet asset from
+        # producing a stop so tight that position size explodes.
         atr_daily = float(row.get("atr_pct_daily") or row["atr_pct_1w"])
         atr_abs = max(atr_daily * entry, entry * 0.01)
         stop_dist = risk.atr_stop_mult * atr_abs
@@ -477,7 +482,7 @@ def propose(scores: pd.DataFrame, store: Store, run_id: str, cfg: Config = CONFI
             "reward_risk": 0.0 if is_exit else round(rr, 2),
             "kind": "exit" if is_exit else "entry",
             "trigger": sig["trigger_label"] if is_exit else "",
-            "horizon": "close now" if is_exit else "1-7 days",
+            "horizon": "close now" if is_exit else _horizon_label(cfg),
             "rationale": (exits_mod.describe(sig, cfg) if is_exit
                           else _rationale(row, c["side"], cfg)),
             "payload": json.dumps(payload, default=str),
@@ -488,6 +493,22 @@ def propose(scores: pd.DataFrame, store: Store, run_id: str, cfg: Config = CONFI
     store.save_proposals(
         df.drop(columns=["risk_usd", "reward_risk", "kind", "trigger"]).to_dict("records"))
     return df
+
+
+def _horizon_label(cfg: Config) -> str:
+    """Human label for the holding horizon, read from config.
+
+    Derived rather than hardcoded: this string was previously the literal
+    "1-7 days" while the exit actually fired on cfg.exits.horizon_days, so
+    changing the setting left every proposal ticket quietly lying about how
+    long the trade was meant to be held.
+    """
+    d = float(cfg.exits.horizon_days)
+    if d <= 1:
+        return "up to 1 day"
+    if d <= 7:
+        return f"1-{d:.0f} days"
+    return f"up to {d:.0f} days"
 
 
 def fmt_price(x: float) -> str:

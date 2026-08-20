@@ -420,6 +420,11 @@ class Store:
                            :horizon_days,:high_water,:proposal_id,:mode,:updated_at)
                    ON CONFLICT(symbol) DO UPDATE SET
                      entry_price=excluded.entry_price,
+                     -- Averaging up raises entry_price; leaving high_water
+                     -- behind would make gain_from_entry negative and silently
+                     -- disarm the trailing stop.
+                     high_water=MAX(COALESCE(position_meta.high_water, 0),
+                                    excluded.entry_price),
                      stop=excluded.stop,
                      target=excluded.target,
                      horizon_days=excluded.horizon_days,
@@ -451,6 +456,22 @@ class Store:
                 )
                 return price
             return current
+
+    def clear_position_target(self, symbol: str) -> None:
+        """Retire the take-profit after a PARTIAL exit has taken it.
+
+        Without this a partial take-profit re-fires on every run: the price is
+        still above the target, so it sells another `take_profit_fraction` of
+        what is left, halving the position indefinitely (100 -> 50 -> 25 -> ...)
+        and paying a fee each time while never actually closing. Clearing the
+        target means the take-profit fires once; the remainder then rides on the
+        trailing stop, the hard stop and the horizon.
+        """
+        with self.conn() as con:
+            con.execute(
+                "UPDATE position_meta SET target=NULL, updated_at=? WHERE symbol=?",
+                (iso(), symbol),
+            )
 
     def delete_position_meta(self, symbol: str) -> None:
         with self.conn() as con:

@@ -12,7 +12,7 @@ ExitConfig:
   stop        price traded through the stop set at entry
   target      price reached the take-profit set at entry
   trailing    gave back more than trail_pct from the high-water mark
-  horizon     held past the 1-7 day thesis the trade was approved on
+  horizon     held past cfg.exits.horizon_days, the thesis it was approved on
   reversal    the composite score that opened it has inverted
 
 Precedence is the order in TRIGGERS below. Stop and target come first because
@@ -71,7 +71,12 @@ def evaluate(store: Store, cfg: Config = CONFIG,
     trailing stop work across runs.
     """
     ex = cfg.exits
-    holdings = {s: q for s, q in (holdings or {}).items() if q > 0}
+    # The quote asset is cash, not a position. On Binance `holdings()` returns
+    # every balance including USDT, and iterating it here can emit a "sell your
+    # cash" signal in edge cases (a stablecoin depeg trips the stop check).
+    quote = cfg.execution.quote_asset
+    holdings = {s: q for s, q in (holdings or {}).items()
+                if q > 0 and s != quote}
     if not ex.enabled or not holdings:
         return pd.DataFrame()
 

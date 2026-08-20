@@ -148,9 +148,11 @@ class RiskConfig:
     risk_per_trade_pct: float = 1.0          # % of equity risked between entry and stop
     max_position_pct: float = 20.0           # cap on any single position as % of equity
     max_total_deployed_pct: float = 60.0     # cap across all proposed trades
-    atr_stop_mult: float = 1.5               # stop distance = mult * ATR(14) on the 1h chart
+    atr_stop_mult: float = 1.5               # stop distance = mult * ATR(14) on DAILY candles
     reward_risk_target: float = 2.0          # take-profit distance = R:R * stop distance
-    min_notional_usd: float = 15.0           # skip dust trades (Binance minNotional is ~$10)
+    # Skip dust trades. Deliberately well above the venue floor: Binance.US
+    # MIN_NOTIONAL on BTCUSDT is $1.00, but sub-$15 positions are mostly fees.
+    min_notional_usd: float = 15.0
     max_proposals: int = 3
     # Minimum |composite| to be proposable. Raise it to be pickier; set it to
     # 0.0 to always surface a full slate of `max_proposals`. It is deliberately
@@ -187,10 +189,10 @@ class ExitConfig:
     take_profit: bool = True
     take_profit_fraction: float = 100.0     # % of the position to sell on a hit
 
-    # 3. Horizon expiry: the 1-7 day thesis has run out of time. A trade held
+    # 3. Horizon expiry: the trade thesis has run out of time. A position held
     #    past its horizon is no longer the trade that was approved.
     horizon_expiry: bool = True
-    horizon_days: float = 7.0
+    horizon_days: float = 30.0
 
     # 4. Trailing stop: give back at most `trail_pct` from the high-water mark,
     #    but only once the position is `trail_activate_pct` in profit - otherwise
@@ -309,6 +311,11 @@ class ExecutionConfig:
     def base_url(self) -> str:
         return self.BASE_URLS[self.venue]
 
+    # Approve every proposal without prompting. Off by default - the human in
+    # the loop is the thing standing between the scoring heuristics and your
+    # money, so removing it has to be a deliberate act.
+    auto_approve: bool = False
+
     @property
     def live_enabled(self) -> bool:
         """Real orders require BOTH the config switch and the env var."""
@@ -317,6 +324,18 @@ class ExecutionConfig:
             and not self.dry_run
             and _env_flag("CRYPTO_YOLO_ALLOW_LIVE", False)
         )
+
+    @property
+    def auto_live_enabled(self) -> bool:
+        """Unattended REAL-money trading: auto-approve combined with live.
+
+        This is the highest-risk configuration the system can be in - an
+        untested scoring heuristic spending real money with nobody watching -
+        so it takes a third switch of its own rather than falling out of two
+        settings that were each reasonable alone.
+        """
+        return self.auto_approve and self.live_enabled and _env_flag(
+            "CRYPTO_YOLO_ALLOW_AUTO_LIVE", False)
 
 
 @dataclass
@@ -370,4 +389,5 @@ def credential_status() -> dict[str, bool]:
         "reddit_oauth": bool(get_secret("reddit_client_id") and get_secret("reddit_client_secret")),
         "github": bool(get_secret("github_token")),
         "live_trading_env": _env_flag("CRYPTO_YOLO_ALLOW_LIVE", False),
+        "auto_live_env": _env_flag("CRYPTO_YOLO_ALLOW_AUTO_LIVE", False),
     }

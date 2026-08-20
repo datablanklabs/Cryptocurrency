@@ -10,9 +10,11 @@ Two ways to run it:
   in-notebook   start(store) spawns a daemon thread. Dies with the kernel, so
                 it only accumulates history while the notebook is open.
 
-  system cron   `python -m cryptoyolo.scheduler --once` from crontab keeps
-                collecting whether or not the notebook is running. This is the
-                one you actually want.
+  scheduled     Use ./collect.py (launchd or cron) - it bootstraps its own
+                sys.path so it runs from any working directory. Do NOT schedule
+                `python -m cryptoyolo.scheduler`: that form only resolves when
+                cwd happens to be the project root, which neither launchd nor
+                cron guarantees. See the README.
 """
 
 from __future__ import annotations
