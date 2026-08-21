@@ -11,8 +11,8 @@ trades through the Binance API.
 jupyter lab crypto_yolo_dashboard.ipynb
 ```
 
-Runs in paper mode out of the box with **no credentials at all** — all three
-features work keyless, including Reddit sentiment (it falls back to Arctic Shift
+Runs in paper mode out of the box with **no credentials at all** — every
+feature works keyless, including Reddit sentiment (it falls back to Arctic Shift
 and Reddit's own Atom feeds). Credentials improve data quality and are needed
 only to place orders.
 
@@ -32,9 +32,11 @@ why an asset ranked where it did, and change any weight you disagree with.
 
 **On signal quality.** Reddit mention volume is trivially gamed and mostly
 lagging; by the time a coin trends on r/wallstreetbets the move that caused the
-trend has usually happened. That's why social carries the lowest weight (0.20).
-The genuinely forward-looking input is the *scheduled* catalyst — a token unlock
-dated next Tuesday is knowable in advance in a way a price move is not.
+trend has usually happened. That's why social carries a low weight. The
+genuinely forward-looking input is the *scheduled* catalyst — a token unlock
+dated next Tuesday is knowable in advance in a way a price move is not. And
+**positioning** is the only family that goes reliably negative; without it the
+composite drifts toward rating everything a buy.
 
 Every run writes its scores and proposals to SQLite specifically so you can
 answer the only question that matters: did high composite scores actually
@@ -60,8 +62,10 @@ cryptoyolo/
   indicators.py   Bollinger, Keltner, Donchian, RSI, MACD, ATR
   charts.py       plotly candlesticks, universe grid, score attribution
   portfolio.py    Feature 0 — account balance, holdings, cost basis, P&L
-  social.py       Feature 2 — Reddit source ladder, mention extraction, sentiment
-  feeds.py        Feature 2b — StockTwits cashtags, Mastodon hashtags
+  social.py       Feature 2 — Reddit source ladder, mention extraction, sentiment,
+                  per-source tone de-biasing
+  feeds.py        Feature 2b — StockTwits cashtags, Mastodon hashtags, 4chan /biz/
+  positioning.py  Feature 4 — perpetual funding rates as a crowding measure
   catalysts.py    Feature 3 — GitHub releases, news RSS, event taxonomy
   exits.py        five configurable exit triggers for open positions
   engine.py       scoring, ranking, risk-based position sizing
@@ -103,10 +107,10 @@ Four price sources are tried in order — `binance` → `coinbase` → `kraken` 
 > addresses. `api.binance.us` works and is the default. Change with
 > `CONFIG.execution.venue`.
 
-### 2 · Reddit sentiment and mention velocity
+### 2 · Social sentiment and mention velocity
 
-Posts *and* comments from r/wallstreetbets and r/cryptocurrency, with a
-crypto-native sentiment lexicon (`moon`, `rug`, `rekt`, 🚀) — generic English
+Posts *and* comments across 13 subreddits plus StockTwits, Mastodon and /biz/,
+with a crypto-native sentiment lexicon (`moon`, `rug`, `rekt`, 🚀) — generic English
 sentiment models score crypto slang badly.
 
 Two decisions worth knowing about:
@@ -214,11 +218,18 @@ Two additional keyless social feeds, both measured before being wired in
 |---|---|---|
 | **StockTwits** | 600 msgs, 600 mentions | Cashtag streams arrive **pre-attributed to a symbol** — the mention matcher is bypassed entirely, so there are no false positives to control. ~57% carry a **user-declared** Bullish/Bearish label: a stated opinion, not one inferred from a word list. All 20 assets resolve, 30 msgs each. |
 | **Mastodon** | 280 statuses, 304 mentions | Public hashtag timelines, no auth, 300 req/window. |
+| **4chan /biz/** | ~920 posts, ~77 mentions | Willing to be negative — ~24% of its mentions score bearish. Anonymous, so weights are flat and damped to 0.6, and it is excluded from author-diversity. |
 
 **Mastodon uses broad tags, not per-asset ones.** Measured: only wide tags are
 alive (#crypto 3.6 posts/h, #bitcoin 3.5/h) while per-asset tags are effectively
 dead — #dot returns one post per 33 hours. Spending a request per asset would
 buy month-old content, so we pull seven broad tags and run the normal extractor.
+
+**What /biz/ actually adds, precisely.** Because de-biasing centres every source
+on its own mean, a platform being more bearish *overall* is centred out — so
+/biz/ does not pull the level down. Its contribution is **cross-asset dispersion
+and coverage** within a differently-minded population. The aggregate positivity
+problem is solved by the de-biasing below, not by adding a bearish venue.
 
 **Sentiment is de-biased per source, and this matters a lot.** StockTwits users
 self-label ~88% Bullish (mean tone **+0.55**, against Reddit's **+0.05**). Fed in
@@ -240,6 +251,40 @@ component reaches ~0.34, which at weight 0.20 contributes ~0.068. The
 trade can be proposed on social sentiment alone — the weakest and most gameable
 of the three families — without corroboration from technicals or a catalyst.
 Lowering it below ~0.07 re-opens that door.
+
+### 4 · Positioning (perpetual funding)
+
+Not social sentiment, which is why it is a **separate family** rather than
+another feed. Social tells you what people are *saying*; funding tells you what
+leveraged traders are *paying* to hold a side. Positive funding = longs pay
+shorts = crowded long.
+
+It earns its own component because it is **the only input that goes genuinely
+negative on its own**. Over 100 periods (~33 days):
+
+| Asset | negative periods | range |
+|---|---|---|
+| SOL | 27% | −0.0103% .. +0.0100% |
+| ETH | 25% | −0.0053% .. +0.0100% |
+| BTC | 10% | −0.0039% .. +0.0100% |
+
+Every social source measured is positive nearly always, so without this the
+composite drifts toward "everything is a buy".
+
+Scored as a z-value against each asset's **own** funding history — 0.01% means
+something different for BTC than for a thin altcoin. Read **contrarian** by
+default (crowded positioning is fragile positioning); `contrarian=False` reads it
+as momentum confirmation instead. Both are defensible; neither is tested here.
+
+**Weights:** `positioning` was added at 0.10 alongside the existing
+0.50/0.20/0.30. Since `normalized()` divides by the sum, the other three keep
+their exact ratios — the effective split becomes 0.45/0.18/0.27/0.09. Set
+`positioning = 0.0` to restore the previous three-family composite.
+
+A caveat visible today: all 20 assets currently sit at the funding cap, so
+positioning applies a near-uniform bearish tilt. The **discrimination** comes
+from the z-magnitude (ETH −0.84 vs LINK −0.49), so compare assets to each other
+rather than to zero.
 
 ### 3 · Developer activity and news catalysts
 

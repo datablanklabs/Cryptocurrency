@@ -29,7 +29,7 @@ CELLS = [
 md(r"""
 # crypto-yolo — trading dashboard
 
-Run all cells. The notebook refreshes three feature families, scores the
+Run all cells. The notebook refreshes four feature families, scores the
 universe, proposes up to **3 ranked trade candidates**, asks you to approve each
 one (auto-approval is opt-in, never the default), and executes the approved ones
 through the Binance API.
@@ -41,8 +41,9 @@ a backstop, since stop, target, trailing and score-reversal usually fire first.
 | Feature | Source | Feeds |
 |---|---|---|
 | **1 · Price & bands** | Binance.US → Coinbase → Kraken → yfinance | technical score |
-| **2 · Social sentiment** | 13 subreddits + StockTwits + Mastodon | social score |
+| **2 · Social sentiment** | 13 subreddits + StockTwits + Mastodon + /biz/ | social score |
 | **3 · Dev & news catalysts** | GitHub releases, CoinDesk/Cointelegraph/Decrypt/Defiant | catalyst score |
+| **4 · Positioning** | OKX perpetual funding rates | positioning score |
 
 ---
 
@@ -58,9 +59,11 @@ as a research shortlist that shows its work, not as a forecast.
 
 **Signal quality, honestly.** Reddit mention volume is trivially gamed and
 mostly lagging — by the time a coin trends on r/wsb, the move usually already
-happened. That is why social is weighted lowest (0.20). The most genuinely
+happened. That is why social carries a low weight. The most genuinely
 forward-looking input here is the *scheduled* catalyst: a token unlock dated
-next Tuesday is knowable in advance in a way that a price move is not.
+next Tuesday is knowable in advance in a way that a price move is not. The
+newest family, **positioning**, is the only one that goes reliably negative —
+without it the composite drifts toward rating everything a buy.
 
 **Execution is gated.** Default mode is `paper` — simulated fills, nothing
 leaves your machine. Real orders need `mode="binance"`, `dry_run=False`, **and**
@@ -179,9 +182,21 @@ CONFIG.exits.score_reversal_threshold = -0.15
 CONFIG.exits.max_exit_proposals       = 3       # exits get their OWN slots
 
 # ── Score weights (must be defensible to you, not to me) ────────────────
-CONFIG.weights.technical = 0.50
-CONFIG.weights.social    = 0.20
-CONFIG.weights.catalyst  = 0.30
+# normalized() divides by the sum, so adding positioning=0.10 alongside the
+# original 0.50/0.20/0.30 preserves their ratios exactly and just makes room.
+# Set positioning = 0.0 to restore the previous three-family composite.
+CONFIG.weights.technical   = 0.50
+CONFIG.weights.social      = 0.20
+CONFIG.weights.catalyst    = 0.30
+CONFIG.weights.positioning = 0.10
+
+# ── Positioning: perpetual funding as a crowding measure ────────────────
+# Contrarian by default — crowded positioning is fragile positioning, so
+# unusually high funding scores bearish. contrarian=False reads it as momentum.
+CONFIG.positioning.enabled     = True
+CONFIG.positioning.contrarian  = True
+CONFIG.positioning.z_scale     = 1.5    # tanh knee, in standard deviations
+CONFIG.positioning.min_periods = 20     # below this, score 0 rather than noise
 
 # ── Chart bands ─────────────────────────────────────────────────────────
 CONFIG.bands.bollinger        = True
@@ -425,7 +440,7 @@ md(r"""
 ---
 ## Feature 2 · Social sentiment & mention velocity
 
-Pulls posts *and* comments from r/wallstreetbets and r/cryptocurrency, extracts
+Pulls posts *and* comments across 13 subreddits, StockTwits, Mastodon and /biz/, extracts
 asset mentions, scores sentiment with a crypto-native lexicon (`moon`, `rug`,
 `rekt`, 🚀 — generic English sentiment models are useless here), and stores
 everything so mention **velocity** can be measured against each asset's own
@@ -554,10 +569,46 @@ else:
 
 md(r"""
 ---
+## Feature 4 · Positioning (funding rates)
+
+Not social sentiment, which is why it is a separate family. Social tells you what
+people are *saying*; funding tells you what leveraged traders are *paying* to hold
+a side. Positive funding means longs pay shorts — a crowded long.
+
+It earns its own component because it is **the only input here that goes
+genuinely negative on its own**. Over 100 periods (~33 days) SOL funding was
+negative 27% of the time and ETH 25%, while every social source measured is
+positive nearly always. Without it the composite drifts toward "everything is a
+buy" — the same failure the per-source sentiment de-biasing had to correct.
+
+Scored as a z-value against each asset's **own** funding history, not an
+absolute threshold: 0.01% means something different for BTC than for a thin
+altcoin. Same relative-to-own-baseline logic as mention velocity.
+"""),
+
+code(r"""
+from cryptoyolo import positioning as positioning_mod
+
+pos_scores = positioning_mod.score_symbols(store, CONFIG)
+display(pos_scores.head(12).style.format({
+    "funding_now": "{:+.4f}%", "funding_mean": "{:+.4f}%",
+    "funding_z": "{:+.2f}", "positioning": "{:+.3f}",
+}, na_rep="—").hide(axis="index"))
+
+_neg = (pos_scores["positioning"] < -0.01).sum()
+_pos = (pos_scores["positioning"] > 0.01).sum()
+print(f"\ncrowded long (scores bearish): {_neg}   crowded short (scores bullish): {_pos}")
+print("A uniform tilt shifts every composite together; the DISCRIMINATION comes")
+print("from the z-magnitude, so compare assets to each other, not to zero.")
+"""),
+
+md(r"""
+---
 ## Decision engine
 
-Composite = `0.50 × technical + 0.20 × social + 0.30 × catalyst`, each component
-in [-1, +1].
+Composite = `0.45 × technical + 0.18 × social + 0.27 × catalyst + 0.09 ×
+positioning` (the normalised form of 0.50/0.20/0.30/0.10), each component in
+[-1, +1].
 
 The one genuinely non-obvious piece is how band position is read: in a trending
 market, price riding the upper Bollinger band is *strength*; in a range-bound

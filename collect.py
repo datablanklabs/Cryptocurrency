@@ -109,6 +109,12 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001
             print(f"  ! feeds failed: {exc}")
 
+        from cryptoyolo import positioning
+        try:
+            positioning.fetch(store, CONFIG, verbose=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  ! funding fetch failed: {exc}")
+
         if args.catalysts:
             from cryptoyolo import catalysts
             try:
