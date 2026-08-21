@@ -12,7 +12,8 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from . import approval, broker as broker_mod, catalysts, engine, exits, feeds, social
+from . import (approval, broker as broker_mod, catalysts, engine, exits, feeds,
+               positioning, social)
 from .config import CONFIG, Config, credential_status, load_dotenv
 from .store import Store, iso, utcnow
 
@@ -51,6 +52,15 @@ def collect(store: Store, cfg: Config = CONFIG, scrape_reddit: bool = True,
         except Exception as exc:  # noqa: BLE001 - engine still runs without them
             print(f"  ! Extra feeds failed: {exc}")
             stats["feeds"] = {}
+
+    if scrape_feeds and cfg.positioning.enabled:
+        if verbose:
+            print("\n[1c] Positioning (funding rates)")
+        try:
+            stats["positioning"] = positioning.fetch(store, cfg, verbose)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  ! Funding fetch failed: {exc}")
+            stats["positioning"] = 0
 
     if scan_catalysts:
         if verbose:

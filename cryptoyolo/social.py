@@ -23,8 +23,16 @@ Three parts:
 
 A caveat worth keeping in mind while reading the output: subreddit mention
 volume is trivially manipulated, and by the time something trends the move that
-caused the trend has usually already happened. This is why social is weighted
-lowest of the three families by default.
+caused the trend has usually already happened. This is why social carries a low
+weight, and why `positioning` exists as a separate family - it is the only input
+that goes reliably negative.
+
+Sources are mixed (Reddit, StockTwits, Mastodon, /biz/) and each has its own tone
+baseline, so sentiment is de-biased per source before assets are compared. One
+consequence worth understanding: because each source is centred on its own mean,
+a platform being more bearish OVERALL is centred out. What a source like /biz/
+contributes is cross-asset dispersion and coverage, not a downward pull on the
+level.
 """
 
 from __future__ import annotations
@@ -789,8 +797,16 @@ def score_symbols(store: Store, cfg: Config = CONFIG) -> pd.DataFrame:
             c = recent["confidence"].to_numpy()
             eff = w * c                        # opinion-free posts barely count
             avg_sent = float((s * eff).sum() / eff.sum()) if eff.sum() > 0 else 0.0
-            authors = recent["author"].nunique()
-            diversity = min(1.0, authors / max(3.0, n_recent * 0.5))
+            # Diversity is measured only over mentions that HAVE an author.
+            # /biz/ is anonymous, so its rows carry author=None; pandas
+            # nunique() skips those, and counting them in the denominator
+            # anyway silently depressed diversity for every asset /biz/
+            # discussed - penalising breadth instead of measuring it.
+            attributed = recent[recent["author"].notna()]
+            authors = attributed["author"].nunique()
+            n_attributed = len(attributed)
+            diversity = (min(1.0, authors / max(3.0, n_attributed * 0.5))
+                         if n_attributed else 0.0)
             avg_conf = float(c.mean())
         else:
             avg_sent, authors, diversity, avg_conf = 0.0, 0, 0.0, 0.0

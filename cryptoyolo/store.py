@@ -184,6 +184,18 @@ CREATE INDEX IF NOT EXISTS idx_protective_symbol ON protective_orders(symbol, st
 -- Daily-refreshed fetch order for subreddits, derived from what each one has
 -- actually delivered (see social.rank_subreddits). Cached because recomputing
 -- it every collection would be wasted work and would make the order jitter.
+-- Realised perpetual funding per asset. Kept as history because the score is a
+-- z-value against each asset's OWN distribution, which needs a distribution.
+CREATE TABLE IF NOT EXISTS funding_rates (
+    symbol       TEXT NOT NULL,
+    funding_time INTEGER NOT NULL,
+    rate         REAL NOT NULL,
+    venue        TEXT,
+    fetched_at   TEXT NOT NULL,
+    PRIMARY KEY (symbol, funding_time)
+);
+CREATE INDEX IF NOT EXISTS idx_funding_symbol ON funding_rates(symbol, funding_time);
+
 CREATE TABLE IF NOT EXISTS source_rank (
     subreddit      TEXT PRIMARY KEY,
     computed_at    TEXT NOT NULL,
@@ -524,6 +536,30 @@ class Store:
     def delete_position_meta(self, symbol: str) -> None:
         with self.conn() as con:
             con.execute("DELETE FROM position_meta WHERE symbol=?", (symbol,))
+
+    # -- funding rates ------------------------------------------------------
+    def upsert_funding(self, rows: Iterable[dict[str, Any]]) -> int:
+        rows = list(rows)
+        if not rows:
+            return 0
+        with self.conn() as con:
+            cur = con.executemany(
+                """INSERT INTO funding_rates(symbol, funding_time, rate, venue, fetched_at)
+                   VALUES (:symbol,:funding_time,:rate,:venue,:fetched_at)
+                   ON CONFLICT(symbol, funding_time) DO UPDATE SET
+                     rate=excluded.rate, fetched_at=excluded.fetched_at""",
+                rows,
+            )
+            return cur.rowcount
+
+    def funding_history(self, symbol: str | None = None) -> pd.DataFrame:
+        q = "SELECT * FROM funding_rates"
+        params: tuple = ()
+        if symbol:
+            q += " WHERE symbol = ?"
+            params = (symbol,)
+        with self.conn() as con:
+            return pd.read_sql_query(q + " ORDER BY funding_time ASC", con, params=params)
 
     # -- source ranking -----------------------------------------------------
     def save_source_rank(self, rows: Iterable[dict[str, Any]]) -> None:

@@ -125,20 +125,27 @@ class BandConfig:
 
 @dataclass
 class ScoreWeights:
-    """How the three feature families combine into one composite score.
+    """How the feature families combine into one composite score.
 
     These are hand-set priors, not fitted parameters. Retune them from the
     backtest-ish attribution table in the notebook rather than trusting them.
+
+    `positioning` was added last and deliberately does NOT rescale the other
+    three: normalized() divides by the sum, so adding 0.10 alongside the
+    existing 0.50/0.20/0.30 preserves their ratios exactly and simply makes
+    room. Set it to 0.0 to restore the previous three-family composite.
     """
     technical: float = 0.50
     social: float = 0.20
     catalyst: float = 0.30
+    positioning: float = 0.10
 
     def normalized(self) -> "ScoreWeights":
-        total = self.technical + self.social + self.catalyst
+        total = self.technical + self.social + self.catalyst + self.positioning
         if total <= 0:
-            return ScoreWeights(1 / 3, 1 / 3, 1 / 3)
-        return ScoreWeights(self.technical / total, self.social / total, self.catalyst / total)
+            return ScoreWeights(0.25, 0.25, 0.25, 0.25)
+        return ScoreWeights(self.technical / total, self.social / total,
+                            self.catalyst / total, self.positioning / total)
 
 
 @dataclass
@@ -317,6 +324,58 @@ class MastodonConfig:
 
 
 @dataclass
+class BizConfig:
+    """4chan /biz/ — https://a.4cdn.org (read-only JSON, no key, no auth).
+
+    Included for one specific reason: it is the only social venue measured that
+    is genuinely willing to be negative. 43% of its scored posts are bearish,
+    against a mean tone of +0.077 - versus StockTwits at +0.48 and Reddit at
+    +0.04. Every other source is a place where people talk their own book, so
+    without something like this the social score can only ever say "buy".
+
+    Two caveats. The board is anonymous, so author diversity cannot damp
+    brigading the way it does elsewhere - weights are deliberately flat. And the
+    prose is crude enough that the lexicon picks up hostility unrelated to any
+    asset, which is part of why this carries a reduced weight.
+    """
+    enabled: bool = True
+    board: str = "biz"
+    include_replies: bool = True    # catalog embeds last_replies: volume, no extra calls
+    request_delay: float = 1.0
+    # Damped relative to other sources: high noise, anonymous, no engagement signal.
+    weight: float = 0.6
+
+
+@dataclass
+class PositioningConfig:
+    """Perpetual funding rates as a crowding measure — OKX public API, no key.
+
+    Not social sentiment, which is why it is a separate family. Funding is what
+    leveraged traders are actually *paying* to hold a side: positive means longs
+    pay shorts (crowded long), negative means the reverse. It is the only input
+    here that goes genuinely negative on its own - measured over 100 periods,
+    SOL was negative 27% of the time and ETH 25%, against social sources that
+    are positive almost always.
+
+    Read contrarian by default: crowded positioning is fragile positioning, so
+    unusually high funding scores bearish. Set `contrarian=False` to read it as
+    momentum confirmation instead.
+
+    Scored against each asset's OWN funding history rather than an absolute
+    threshold, for the same reason mention velocity is: 0.01% means something
+    different for BTC than for a thin altcoin.
+    """
+    enabled: bool = True
+    venue_url: str = "https://www.okx.com/api/v5/public/funding-rate-history"
+    inst_template: str = "{symbol}-USDT-SWAP"
+    history_periods: int = 100      # ~33 days at 8h funding intervals
+    request_delay: float = 0.35
+    contrarian: bool = True
+    z_scale: float = 1.5            # tanh knee, in standard deviations
+    min_periods: int = 20           # below this the z-score is noise; score 0
+
+
+@dataclass
 class CatalystConfig:
     news_feeds: tuple[tuple[str, str], ...] = (
         ("CoinDesk", "https://feeds.feedburner.com/CoinDesk"),
@@ -430,6 +489,8 @@ class Config:
     reddit: RedditConfig = field(default_factory=RedditConfig)
     stocktwits: StockTwitsConfig = field(default_factory=StockTwitsConfig)
     mastodon: MastodonConfig = field(default_factory=MastodonConfig)
+    biz: BizConfig = field(default_factory=BizConfig)
+    positioning: PositioningConfig = field(default_factory=PositioningConfig)
     catalysts: CatalystConfig = field(default_factory=CatalystConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
 

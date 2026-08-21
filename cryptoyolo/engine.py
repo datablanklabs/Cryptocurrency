@@ -1,4 +1,4 @@
-"""The decision engine: three feature families -> ranked trade candidates.
+"""The decision engine: four feature families -> ranked trade candidates.
 
 What this does and does not claim
 ---------------------------------
@@ -33,6 +33,7 @@ import pandas as pd
 
 from . import catalysts as catalysts_mod
 from . import indicators, prices
+from . import positioning as positioning_mod
 from . import social as social_mod
 from .config import CONFIG, Config
 from .store import Store, iso, utcnow
@@ -126,6 +127,7 @@ def build_scores(store: Store, cfg: Config = CONFIG, verbose: bool = True,
     """
     social_df = social_mod.score_symbols(store, cfg).set_index("symbol")
     catalyst_df = catalysts_mod.score_symbols(store, cfg).set_index("symbol")
+    pos_df = positioning_mod.score_symbols(store, cfg).set_index("symbol")
     weights = cfg.weights.normalized()
 
     universe = set(cfg.symbols)
@@ -154,12 +156,15 @@ def build_scores(store: Store, cfg: Config = CONFIG, verbose: bool = True,
         tech, tech_parts = technical_score(short, medium)
         soc = float(social_df.loc[symbol, "social"]) if symbol in social_df.index else 0.0
         cat = float(catalyst_df.loc[symbol, "catalyst"]) if symbol in catalyst_df.index else 0.0
-        composite = weights.technical * tech + weights.social * soc + weights.catalyst * cat
+        pos = float(pos_df.loc[symbol, "positioning"]) if symbol in pos_df.index else 0.0
+        composite = (weights.technical * tech + weights.social * soc
+                     + weights.catalyst * cat + weights.positioning * pos)
 
         components = {
             "technical_parts": tech_parts,
             "social": social_df.loc[symbol].to_dict() if symbol in social_df.index else {},
             "catalyst": catalyst_df.loc[symbol].to_dict() if symbol in catalyst_df.index else {},
+            "positioning": pos_df.loc[symbol].to_dict() if symbol in pos_df.index else {},
             "snapshot_1d": short,
             "snapshot_1w": medium,
             "snapshot_daily": daily,
@@ -171,10 +176,12 @@ def build_scores(store: Store, cfg: Config = CONFIG, verbose: bool = True,
             "technical": round(tech, 4),
             "social": round(soc, 4),
             "catalyst": round(cat, 4),
+            "positioning": round(pos, 4),
             "composite": round(composite, 4),
             "w_technical": round(weights.technical * tech, 4),
             "w_social": round(weights.social * soc, 4),
             "w_catalyst": round(weights.catalyst * cat, 4),
+            "w_positioning": round(weights.positioning * pos, 4),
             "price": round(medium["close"], 6),
             "atr_pct_1w": round(medium.get("atr_pct", 0.0), 5),
             "atr_pct_daily": round(daily.get("atr_pct", medium.get("atr_pct", 0.02)), 5),
@@ -203,7 +210,9 @@ def _rationale(row: pd.Series, side: str, cfg: Config) -> str:
     bits: list[str] = []
 
     drivers = sorted(
-        [("technical", row["w_technical"]), ("social", row["w_social"]), ("catalyst", row["w_catalyst"])],
+        [("technical", row["w_technical"]), ("social", row["w_social"]),
+         ("catalyst", row["w_catalyst"]),
+         ("positioning", row.get("w_positioning", 0.0))],
         key=lambda kv: abs(kv[1]), reverse=True,
     )
     lead, lead_val = drivers[0]
@@ -235,6 +244,15 @@ def _rationale(row: pd.Series, side: str, cfg: Config) -> str:
         )
     else:
         bits.append("Catalysts: none found in window.")
+
+    pos = c.get("positioning", {})
+    if pos and pos.get("n_periods"):
+        stance = "crowded long" if row.get("positioning", 0) < 0 else "crowded short"
+        bits.append(
+            f"Positioning: funding {pos.get('funding_now', 0):+.4f}% vs its own mean "
+            f"{pos.get('funding_mean', 0):+.4f}% (z {pos.get('funding_z', 0):+.2f}) — "
+            f"{stance}, read contrarian."
+        )
 
     if side == "SELL":
         bits.append("Bearish score on an existing holding — proposed as an exit, not a short.")

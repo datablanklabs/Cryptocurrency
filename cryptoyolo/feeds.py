@@ -23,6 +23,7 @@ cross-platform average.
 
 from __future__ import annotations
 
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -192,10 +193,89 @@ def fetch_mastodon(cfg: Config = CONFIG, verbose: bool = True
 
 
 # --------------------------------------------------------------------------
+# 4chan /biz/
+# --------------------------------------------------------------------------
+_BACKLINK_RE = re.compile(r">>\d+")
+
+
+def _clean_biz(html_text: str) -> str:
+    """Strip 4chan markup: post backlinks (>>12345) carry no sentiment."""
+    txt = _BACKLINK_RE.sub(" ", _strip_tags(html_text or ""))
+    return " ".join(txt.split())
+
+
+def fetch_biz(cfg: Config = CONFIG, verbose: bool = True
+              ) -> tuple[list[dict], list[dict]]:
+    """Thread OPs plus the replies the catalog already embeds.
+
+    `last_replies` comes free inside the catalog response, so we get the newest
+    few posts per thread without a request each - which matters, since replies
+    are where the actual opinions are and OPs are mostly bait.
+    """
+    bz = cfg.biz
+    if not bz.enabled:
+        return [], []
+    sess = _session(cfg)
+    patterns = _build_patterns(cfg)
+    posts: list[dict] = []
+    mentions: list[dict] = []
+
+    try:
+        r = sess.get(f"https://a.4cdn.org/{bz.board}/catalog.json",
+                     timeout=cfg.http_timeout)
+        r.raise_for_status()
+        pages = r.json()
+    except Exception as exc:  # noqa: BLE001
+        if verbose:
+            print(f"  /{bz.board}/ catalog failed ({exc})")
+        return [], []
+
+    items: list[dict] = []
+    for page in pages if isinstance(pages, list) else []:
+        for th in page.get("threads", []):
+            items.append(th)
+            if bz.include_replies:
+                items.extend(th.get("last_replies") or [])
+
+    for it in items:
+        text = _clean_biz(f"{it.get('sub','')} {it.get('com','')}")
+        if not text:
+            continue
+        pid = f"4c_{it.get('no')}"
+        created = float(it.get("time") or 0)
+        posts.append(_row(pid, f"/{bz.board}/", "biz", "post", None, created,
+                          it.get("replies", 0), "", text,
+                          f"https://boards.4chan.org/{bz.board}/thread/{it.get('resto') or it.get('no')}"))
+
+        found = extract_symbols(text, patterns)
+        if not found:
+            continue
+        pol, conf = sentiment(text)
+        for symbol, matched_on in found.items():
+            mentions.append({
+                "post_id": pid, "symbol": symbol, "subreddit": f"/{bz.board}/",
+                "source": "biz", "author": None, "created_utc": created,
+                "sentiment": pol, "confidence": conf,
+                # Anonymous board: no karma, no author diversity to lean on.
+                "weight": float(bz.weight),
+                "matched_on": matched_on,
+            })
+    time.sleep(bz.request_delay)
+
+    if verbose:
+        neg = sum(1 for m in mentions if m["sentiment"] < 0)
+        share = neg / len(mentions) * 100 if mentions else 0
+        print(f"  /{bz.board}/: {len(posts)} posts, {len(mentions)} mentions "
+              f"({share:.0f}% bearish)")
+    return posts, mentions
+
+
+# --------------------------------------------------------------------------
 def scrape(store: Store, cfg: Config = CONFIG, verbose: bool = True) -> dict[str, int]:
     """Collect every enabled non-Reddit feed and persist it."""
-    stats = {"stocktwits": 0, "mastodon": 0, "mentions": 0}
-    for name, fn in (("stocktwits", fetch_stocktwits), ("mastodon", fetch_mastodon)):
+    stats = {"stocktwits": 0, "mastodon": 0, "biz": 0, "mentions": 0}
+    for name, fn in (("stocktwits", fetch_stocktwits), ("mastodon", fetch_mastodon),
+                     ("biz", fetch_biz)):
         try:
             posts, mentions = fn(cfg, verbose)
         except Exception as exc:  # noqa: BLE001 - one platform must not sink the rest
