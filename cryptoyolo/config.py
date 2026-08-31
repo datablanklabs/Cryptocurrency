@@ -95,6 +95,44 @@ ASSET_BY_SYMBOL: dict[str, Asset] = {a.symbol: a for a in UNIVERSE}
 
 
 # --------------------------------------------------------------------------
+# Scheduled dated events (Feature 5)
+# --------------------------------------------------------------------------
+# Hand-maintained schedule of KNOWN FUTURE dates. This is the one genuinely
+# forward-looking input in the system: unlike a news headline, a cliff unlock
+# on the 14th is knowable on the 1st. Keep it current — a stale schedule is
+# worse than an empty one because it scores confidently on events that already
+# passed (they drop out automatically `lookback_days` after the date).
+#
+#   date        ISO date of the event (UTC)
+#   kind        token_unlock | mainnet | upgrade | etf_decision | listing | undefined
+#   magnitude   for token_unlock: % of circulating supply unlocking (e.g. 4.2).
+#               for everything else: a 0..1 subjective size (0.3 minor, 1.0 major).
+#   direction   -1 bearish / +1 bullish / 0 let magnitude+kind decide
+#   note        free text, shown in the rationale
+#
+# EDIT THIS. The entries below are illustrative placeholders, not researched
+# facts — replace them with real dates before trusting the `events` family.
+
+@dataclass(frozen=True)
+class ScheduledEvent:
+    symbol: str
+    date: str
+    kind: str = "unlock"
+    magnitude: float = 0.5
+    direction: int = 0
+    note: str = ""
+
+
+SCHEDULED_EVENTS: tuple[ScheduledEvent, ...] = (
+    # e.g. ScheduledEvent("ARB", "2026-09-16", "token_unlock", 2.1, -1,
+    #                      "monthly cliff unlock, ~2% of circulating"),
+    # e.g. ScheduledEvent("OP",  "2026-09-30", "token_unlock", 5.4, -1,
+    #                      "large scheduled unlock"),
+    # e.g. ScheduledEvent("SUI", "2026-09-01", "token_unlock", 1.3, -1, ""),
+)
+
+
+# --------------------------------------------------------------------------
 # Chart timeframes -> (lookback, candle interval)
 # --------------------------------------------------------------------------
 # Interval strings are canonical; each price source maps them to its own vocab.
@@ -127,44 +165,124 @@ class BandConfig:
 class ScoreWeights:
     """How the feature families combine into one composite score.
 
-    These are hand-set priors, not fitted parameters. Retune them from the
-    backtest-ish attribution table in the notebook rather than trusting them.
+    These are hand-set priors, not fitted parameters. Once the database holds a
+    few weeks of runs, `evaluation.recommend_weights()` measures each family's
+    information coefficient against realised forward returns and prints a
+    data-driven weight vector to replace these guesses. Do that before trusting
+    them.
 
-    `positioning` was added last and deliberately does NOT rescale the other
-    three: normalized() divides by the sum, so adding 0.10 alongside the
-    existing 0.50/0.20/0.30 preserves their ratios exactly and simply makes
-    room. Set it to 0.0 to restore the previous three-family composite.
+    `positioning` and `events` were added after the fact and deliberately do NOT
+    rescale the others: normalized() divides by the sum, so adding a family
+    alongside the existing weights preserves every prior ratio and simply makes
+    room. Set any weight to 0.0 to drop that family entirely.
     """
     technical: float = 0.50
     social: float = 0.20
     catalyst: float = 0.30
     positioning: float = 0.10
+    # Scheduled dated events (token unlocks, mainnet dates, ETF decisions,
+    # listing effective dates). The only genuinely forward-looking family here.
+    # Defaults to 0.0 because config.SCHEDULED_EVENTS ships EMPTY - a non-zero
+    # weight on an all-zero family would just dilute every other family's real
+    # contribution. Raise this (0.15 is a sensible start) once you populate the
+    # schedule. See calendar_events.py.
+    events: float = 0.0
+    # Cross-sectional momentum is NOT a family — it is a blend coefficient that
+    # folds an asset's trailing-return rank *relative to the universe* into its
+    # technical score. `technical_final = (1 - b) * technical + b * xsec_z`.
+    # 0.0 restores the isolated per-asset technical score. Cross-sectional
+    # momentum is one of the few robust crypto factors, and the isolated
+    # technical score cannot see it.
+    xsec_momentum_blend: float = 0.30
 
     def normalized(self) -> "ScoreWeights":
-        total = self.technical + self.social + self.catalyst + self.positioning
+        fam = (self.technical, self.social, self.catalyst,
+               self.positioning, self.events)
+        total = sum(fam)
         if total <= 0:
-            return ScoreWeights(0.25, 0.25, 0.25, 0.25)
-        return ScoreWeights(self.technical / total, self.social / total,
-                            self.catalyst / total, self.positioning / total)
+            return ScoreWeights(0.2, 0.2, 0.2, 0.2, 0.2,
+                                xsec_momentum_blend=self.xsec_momentum_blend)
+        return ScoreWeights(
+            self.technical / total, self.social / total, self.catalyst / total,
+            self.positioning / total, self.events / total,
+            xsec_momentum_blend=self.xsec_momentum_blend,
+        )
 
 
 @dataclass
 class RiskConfig:
     """Position sizing and guardrails."""
     account_equity_usd: float = 10_000.0
+    # Size against live equity (cash + marked-to-market positions) instead of
+    # the static `account_equity_usd` above. This is what makes the book
+    # compound: after a good run the risk budget grows, after a drawdown it
+    # shrinks, without you editing a config field every week. Falls back to
+    # `account_equity_usd` whenever live equity can't be read (no credentials,
+    # API error) - unknown is not treated as zero.
+    size_off_live_equity: bool = True
     risk_per_trade_pct: float = 1.0          # % of equity risked between entry and stop
     max_position_pct: float = 20.0           # cap on any single position as % of equity
     max_total_deployed_pct: float = 60.0     # cap across all proposed trades
     atr_stop_mult: float = 1.5               # stop distance = mult * ATR(14) on DAILY candles
     reward_risk_target: float = 2.0          # take-profit distance = R:R * stop distance
+
+    # ---- Correlation-aware sizing --------------------------------------
+    # "1% risk each" on three alt longs that move together is really ~2.5% of
+    # one bet. This caps the CORRELATION-ADJUSTED risk of the new BUY slate:
+    # portfolio_heat = sqrt(r' C r) with r the per-trade $ risk vector and C the
+    # trailing return-correlation matrix. If it exceeds `max_portfolio_heat_pct`
+    # of equity the whole slate scales down. The regime gate is a blunt macro
+    # switch; this is the micro one. Set False to disable (fall back to the
+    # gross deployment cap only).
+    correlation_sizing: bool = True
+    max_portfolio_heat_pct: float = 2.5     # cap on sqrt(r' C r) as % of equity
+    corr_lookback_days: int = 60            # trailing window for the correlation matrix
+
+    # ---- Stop distance vs holding horizon --------------------------------
+    # "horizon" scales the stop by sqrt(stop_horizon_days) so a multi-week hold
+    # is not stopped out by a single day's noise. 1.5x daily ATR is ~3-5% for a
+    # major, which for a 10-30 day thesis sits *inside* the normal daily range
+    # and guarantees whipsaw. "legacy" keeps the old 1.5x-daily-ATR stop.
+    stop_scaling: str = "horizon"           # "horizon" | "legacy"
+    stop_horizon_days: float = 10.0         # expected trade duration used for stop sizing
+    stop_min_pct: float = 3.0              # floor on stop distance, % of entry
+    stop_max_pct: float = 40.0            # cap, so a wild alt can't imply a 90% stop
+    # A clamped-wide stop plus a fixed reward:risk can imply a target 80%+ away
+    # that no 30-day hold will ever reach - the trade then only ever exits via
+    # stop / trailing / horizon and the printed R:R is fiction. Cap the target
+    # distance at this % of entry so the R:R is honestly reduced instead.
+    target_pct_cap: float = 60.0
+
+    # ---- Fee-aware targets ----------------------------------------------
+    # Widen the take-profit so that the *net* reward:risk after a round-trip
+    # (fees + modelled slippage, both legs) still equals `reward_risk_target`.
+    # Without it a nominal 2:1 trade is really ~1.8:1 once Binance.US costs are
+    # paid twice.
+    fee_adjust_targets: bool = True
+
+    # ---- Candidate selection ------------------------------------------
+    # "relative" ranks the cross-section and takes the top `max_proposals`
+    # names whose composite clears `min_composite_floor` - so a broad down day
+    # can still surface the best *relative* longs, and a broad up day doesn't
+    # wave everything through. "absolute" keeps the old fixed-threshold gate.
+    selection_mode: str = "relative"        # "relative" | "absolute"
+    min_composite_floor: float = 0.03       # relative mode: never trade pure noise
+    # A held asset is only *trimmed* on the buy-side scoreboard once its
+    # composite is this bearish. Deliberately wider than min_composite_floor:
+    # trimming on a -0.04 blip just churns fees, and exits.py already forces a
+    # full exit at score_reversal_threshold (-0.15). Applies in both selection
+    # modes.
+    trim_threshold: float = 0.10
+
     # Skip dust trades. Deliberately well above the venue floor: Binance.US
     # MIN_NOTIONAL on BTCUSDT is $1.00, but sub-$15 positions are mostly fees.
     min_notional_usd: float = 15.0
     max_proposals: int = 3
-    # Minimum |composite| to be proposable. Raise it to be pickier; set it to
-    # 0.0 to always surface a full slate of `max_proposals`. It is deliberately
-    # not 0 by default: on a genuinely directionless day the honest output is
-    # one candidate, or none, rather than three manufactured ones.
+    # Minimum |composite| to be proposable in "absolute" selection mode. Raise
+    # it to be pickier; set it to 0.0 to always surface a full slate. It is
+    # deliberately not 0: on a genuinely directionless day the honest output is
+    # one candidate, or none, rather than three manufactured ones. Ignored when
+    # `selection_mode == "relative"` (which uses `min_composite_floor`).
     min_composite_score: float = 0.10
     # Exits are proposed and executed before entries, so their proceeds are
     # spendable by the buys in the same run. That projection is discounted by
@@ -172,6 +290,132 @@ class RiskConfig:
     # quoted notional, and sizing buys off an optimistic figure is how you end
     # up with a rejected final order.
     exit_proceeds_haircut_pct: float = 1.0
+
+
+@dataclass
+class FeeConfig:
+    """Trading costs — the return the engine gives away on every trade.
+
+    Binance.US charges roughly 0.4% taker / 0.4% maker at the base fee tier, an
+    order of magnitude above Binance.com's 0.1%. A round trip is therefore
+    ~0.8%+, which against a nominal 2R target of ~8% is a large slice of the
+    edge. Three levers here:
+
+      * `use_bnb_discount`   pay fees in BNB for a 25% cut (must hold BNB).
+      * a lower fee tier      earned with 30-day volume; drop the bps below.
+      * maker over taker      post a limit that rests instead of crossing.
+
+    `slippage_bps` is the *modelled* execution cost applied to PAPER fills so
+    that the paper track record is not systematically better than live. Once
+    live fills accumulate, compare the recorded per-fill `slippage_bps` /
+    `fee_bps` in the order log against these assumptions and adjust.
+    """
+    enabled: bool = True
+    taker_bps: float = 40.0            # Binance.US base tier ~= 0.40%
+    maker_bps: float = 40.0           # ~= 0.40%; earn a lower tier with volume
+    use_bnb_discount: bool = False
+    bnb_discount_pct: float = 25.0
+
+    # Paper-fill realism. A market order pays the spread plus some impact; a
+    # marketable limit caps that. This is a flat estimate — refine from the
+    # per-fill slippage recorded in the order log.
+    slippage_bps: float = 6.0
+    # Extra impact for orders that are large relative to the asset. Applied as
+    # `impact_bps_per_1pct_adv * (notional / est_daily_dollar_volume * 100)`.
+    # Left at 0 by default (daily volume isn't always available); set it if you
+    # trade thin alts in size.
+    impact_bps_per_1pct_adv: float = 0.0
+
+    def _apply_bnb(self, bps: float) -> float:
+        return bps * (1 - self.bnb_discount_pct / 100.0) if self.use_bnb_discount else bps
+
+    @property
+    def effective_taker_bps(self) -> float:
+        return self._apply_bnb(self.taker_bps) if self.enabled else 0.0
+
+    @property
+    def effective_maker_bps(self) -> float:
+        return self._apply_bnb(self.maker_bps) if self.enabled else 0.0
+
+    @property
+    def round_trip_bps(self) -> float:
+        """Fees only: entry taker + exit taker. Used for the 'fee ≈ $x' label."""
+        return 2 * self.effective_taker_bps
+
+    @property
+    def round_trip_cost_bps(self) -> float:
+        """Full round-trip drag a target must clear: fees + slippage, both legs.
+
+        `round_trip_bps` is fees alone; a real round trip also pays the spread
+        twice, so target-widening uses this larger figure.
+        """
+        slip = self.slippage_bps if self.enabled else 0.0
+        return 2 * self.effective_taker_bps + 2 * slip
+
+
+@dataclass
+class RegimeConfig:
+    """Market-regime gate: how much long exposure the tape currently justifies.
+
+    Long-only alt exposure while BTC is in a downtrend is structurally
+    negative-EV — the majors drag everything with them (cross-correlation runs
+    0.7-0.9), so a great relative pick still loses money. This scales the whole
+    slate's deployment by where BTC sits against its long moving average, and
+    can block new entries outright in a hard downtrend. Exits are never gated.
+
+    State is decided on BTC daily candles, with a dead-band around the MA so
+    that price chopping across it does not flip the gate every cycle:
+      risk_on   price > MA * (1 + ma_band_pct/100) and the MA rising
+      risk_off  price < MA * (1 - ma_band_pct/100), or a deep drawdown
+      neutral   inside the band, or above a flat/falling MA
+    """
+    enabled: bool = True
+    ma_days: int = 200
+    # Dead-band around the MA, in %. Price must be this far past the MA to flip
+    # the gate; inside the band the state is "neutral". 0 = a bare MA cross
+    # (noisy). 2% is a reasonable default for BTC.
+    ma_band_pct: float = 2.0
+    # If fewer than this many daily candles are available the MA is unreliable
+    # and the gate abstains (returns neutral with a note).
+    min_candles: int = 150
+    # Deployment multiplier applied to max_total_deployed_pct per state.
+    risk_on_exposure: float = 1.0
+    neutral_exposure: float = 0.5
+    risk_off_exposure: float = 0.0
+    # In risk_off, drop new BUY proposals entirely rather than just shrinking
+    # them. Exits and existing positions are unaffected.
+    block_new_entries_when_risk_off: bool = True
+    # A drawdown from the trailing high past this also forces risk_off even if
+    # price is still inside the MA band.
+    drawdown_risk_off_pct: float = 25.0
+
+
+@dataclass
+class EventsConfig:
+    """Feature 5: scheduled, dated catalysts.
+
+    Distinct from the `catalyst` family, which scores news that has *already*
+    been published (and usually already moved the price). This family scores
+    events with a KNOWN FUTURE DATE — token unlocks, mainnet launches, ETF
+    decision deadlines, exchange-listing effective dates — by how close the
+    date is and how big the event is. A cliff unlock worth 8% of circulating
+    supply nine days out is a knowable headwind in a way a price move is not.
+
+    The schedule is maintained by hand in `SCHEDULED_EVENTS` (below) and/or
+    pulled from a public unlock feed when `fetch_unlocks` is set and the source
+    is reachable. Each event scores on a tent function: it ramps up as the date
+    approaches, peaks in the `peak_window_days` before it, then decays after.
+    """
+    enabled: bool = True
+    lookahead_days: float = 30.0        # ignore events further out than this
+    lookback_days: float = 3.0          # keep scoring briefly after the date
+    peak_window_days: float = 7.0       # full weight inside this many days of the event
+    # Magnitude -> score scale. An unlock of `unlock_pct_full_weight` of
+    # circulating supply (or an event with magnitude 1.0) maps to a full-
+    # strength signal; smaller ones scale down linearly.
+    unlock_pct_full_weight: float = 5.0
+    fetch_unlocks: bool = False
+    unlocks_url: str = ""              # optional public JSON feed; failquietly if unset
 
 
 @dataclass
@@ -409,9 +653,24 @@ class ExecutionConfig:
     venue: str = "binance-us"
     dry_run: bool = True
     quote_asset: str = "USDT"
-    order_type: str = "MARKET"          # "MARKET" | "LIMIT"
+    order_type: str = "MARKET"          # "MARKET" | "LIMIT" — used for EXITS (must fill)
     limit_offset_bps: float = 5.0       # for LIMIT: how far through the mid to place
     recv_window_ms: int = 5_000
+
+    # ---- Entry execution: bound the slippage a market order can't ----------
+    # A plain MARKET entry on a thin alt pays the full spread plus impact, and
+    # you find out the cost only after the fill. A *marketable* limit crosses
+    # the book (so it still fills promptly, usually as taker) but never worse
+    # than `entry_limit_cross_bps` through the reference price — the slippage is
+    # capped instead of open-ended. Set `entry_order_type="MARKET"` to restore
+    # the old behaviour. Exits always use `order_type` above.
+    entry_order_type: str = "LIMIT"          # "LIMIT" (marketable) | "MARKET"
+    entry_limit_cross_bps: float = 15.0      # max adverse cross for an entry limit
+    # Refuse an entry whose price has drifted this far above the proposal price
+    # since it was sized. A guard against sending size into a market that has
+    # gapped away. 0 disables the check. Read it through
+    # `entry_slippage_guard_bps`, not directly — see that property.
+    max_entry_slippage_bps: float = 60.0
 
     # ---- Protective orders resting on the exchange after an entry fills ----
     # These are what give protection *between* notebook runs. The exits pass
@@ -452,6 +711,23 @@ class ExecutionConfig:
     def base_url(self) -> str:
         return self.BASE_URLS[self.venue]
 
+    @property
+    def entry_slippage_guard_bps(self) -> float:
+        """The drift that actually refuses an entry.
+
+        `max_entry_slippage_bps` on its own can be set below
+        `entry_limit_cross_bps` by accident, which is incoherent: you'd reject
+        an entry for drifting less than the limit is already willing to cross.
+        This keeps the guard at least a margin above the cross for a LIMIT
+        entry. 0 (disabled) is honoured as-is.
+        """
+        raw = self.max_entry_slippage_bps
+        if raw <= 0:
+            return 0.0
+        if self.entry_order_type.upper() == "LIMIT":
+            return max(raw, self.entry_limit_cross_bps + 20.0)
+        return raw
+
     # Approve every proposal without prompting. Off by default - the human in
     # the loop is the thing standing between the scoring heuristics and your
     # money, so removing it has to be a deliberate act.
@@ -480,6 +756,29 @@ class ExecutionConfig:
 
 
 @dataclass
+class NotifyConfig:
+    """Out-of-band alerts — see `cryptoyolo/notify.py`. Every channel optional;
+    with none set, alerts degrade to a log line.
+
+    Routine fills are OFF by default: a daily auto-approve paper job would
+    otherwise ping several times a day. The events left on are the ones you
+    actually want to interrupt you.
+    """
+    enabled: bool = True
+    macos_banner: bool = True
+    ntfy_url: str = ""       # e.g. https://ntfy.sh/your-private-topic  (or env CRYPTO_YOLO_NTFY_URL)
+    webhook_url: str = ""    # Slack/Discord incoming webhook           (or env CRYPTO_YOLO_ALERT_WEBHOOK)
+
+    on_execution: bool = False          # every fill
+    on_rejection: bool = True           # an order the engine sent was rejected
+    on_exit_trigger: bool = True        # a stop / target / trailing / horizon exit filled
+    on_regime_risk_off: bool = True     # the BTC-trend gate flipped to risk_off
+    on_price_fallback: bool = True      # scoring fell through to the yfinance backstop
+    on_drawdown: bool = True
+    drawdown_alert_pct: float = 10.0    # alert when equity is this far below its own peak
+
+
+@dataclass
 class Config:
     universe: tuple[Asset, ...] = UNIVERSE
     bands: BandConfig = field(default_factory=BandConfig)
@@ -492,7 +791,11 @@ class Config:
     biz: BizConfig = field(default_factory=BizConfig)
     positioning: PositioningConfig = field(default_factory=PositioningConfig)
     catalysts: CatalystConfig = field(default_factory=CatalystConfig)
+    events: EventsConfig = field(default_factory=EventsConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
+    fees: FeeConfig = field(default_factory=FeeConfig)
+    regime: RegimeConfig = field(default_factory=RegimeConfig)
+    notify: NotifyConfig = field(default_factory=NotifyConfig)
 
     db_path: Path = DATA_DIR / "crypto_yolo.sqlite"
     http_timeout: int = 20

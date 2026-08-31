@@ -26,7 +26,6 @@ import hmac
 import json
 import time
 import uuid
-from datetime import datetime, timezone
 from decimal import ROUND_DOWN, Decimal
 from typing import Any
 from urllib.parse import urlencode
@@ -34,7 +33,7 @@ from urllib.parse import urlencode
 import requests
 
 from .config import CONFIG, Config, get_secret
-from .store import Store, iso, utcnow
+from .store import Store, iso
 
 
 class BinanceError(RuntimeError):
@@ -43,6 +42,60 @@ class BinanceError(RuntimeError):
     def __init__(self, status: int, code: Any, message: str):
         self.status, self.code, self.message = status, code, message
         super().__init__(f"HTTP {status} · code {code} · {message}")
+
+
+# Every terminal status that means "this order did NOT open a position".
+# Anything downstream that treats a fill as real (position metadata, protective
+# orders, the ✓ mark) must check membership here, not a hand-rolled subset —
+# adding a new rejection reason to one call site and forgetting the others is
+# how a phantom position gets a stop order placed against it.
+REJECTED_STATES: frozenset[str] = frozenset(
+    {"REJECTED", "REJECTED_INSUFFICIENT_CASH", "REJECTED_SLIPPAGE", "EXPIRED_NO_FILL"}
+)
+
+
+def is_rejected(status: str | None) -> bool:
+    return (status or "") in REJECTED_STATES
+
+
+# --------------------------------------------------------------------------
+# Trading costs
+# --------------------------------------------------------------------------
+# Fees and slippage are return the engine gives away on every trade. The paper
+# broker MUST model them or its track record reads better than a live account
+# ever could, and `evaluation`'s paper-vs-live comparison becomes meaningless.
+
+def commission_usd(notional: float, cfg: Config = CONFIG, *, maker: bool = False) -> float:
+    """Exchange fee for one fill, in quote currency."""
+    f = cfg.fees
+    if not f.enabled:
+        return 0.0
+    bps = f.effective_maker_bps if maker else f.effective_taker_bps
+    return abs(notional) * bps / 10_000.0
+
+
+def slippage_bps(notional: float, cfg: Config = CONFIG, *,
+                 order_type: str = "MARKET", adv_usd: float | None = None) -> float:
+    """Modelled execution slippage in basis points, before direction.
+
+    Flat spread/impact estimate (`fees.slippage_bps`), optionally plus a term
+    for size relative to the asset's daily dollar volume. A marketable LIMIT
+    caps the adverse cross, so it is charged the smaller of the model and the
+    configured cross.
+    """
+    f = cfg.fees
+    bps = f.slippage_bps if f.enabled else 0.0
+    if adv_usd and adv_usd > 0 and f.impact_bps_per_1pct_adv:
+        bps += f.impact_bps_per_1pct_adv * (abs(notional) / adv_usd * 100.0)
+    if order_type.upper() == "LIMIT":
+        bps = min(bps, cfg.execution.entry_limit_cross_bps)
+    return max(0.0, bps)
+
+
+def apply_slippage(price: float, side: str, bps: float) -> float:
+    """Move a fill price adversely: a BUY pays up, a SELL gives up ground."""
+    adj = bps / 10_000.0
+    return price * (1 + adj) if side.upper() == "BUY" else price * (1 - adj)
 
 
 class BinanceClient:
@@ -59,6 +112,8 @@ class BinanceClient:
             self.session.headers.update({"X-MBX-APIKEY": self.key})
         self._time_offset_ms = 0
         self._filters: dict[str, dict] = {}
+        self._price_cache: dict[str, tuple[float, float]] = {}   # pair -> (ts, price)
+        self._price_ttl = 3.0                                    # seconds
 
     # -- plumbing -----------------------------------------------------------
     @property
@@ -200,12 +255,32 @@ class BinanceClient:
         }
 
     def price(self, pair: str) -> float:
-        return float(self._request("GET", "/api/v3/ticker/price", {"symbol": pair})["price"])
+        """Last trade price, cached for `_price_ttl` seconds.
+
+        preflight and execute both need the live quote for the same pair within
+        a second or two of each other; without the cache that is two identical
+        REST calls per proposal.
+        """
+        hit = self._price_cache.get(pair)
+        if hit and (time.time() - hit[0]) < self._price_ttl:
+            return hit[1]
+        px = float(self._request("GET", "/api/v3/ticker/price", {"symbol": pair})["price"])
+        self._price_cache[pair] = (time.time(), px)
+        return px
 
     # -- orders -------------------------------------------------------------
     def place_order(self, pair: str, side: str, qty: str, order_type: str = "MARKET",
                     price: str | None = None, client_id: str | None = None,
-                    test: bool = True) -> dict:
+                    test: bool = True, time_in_force: str = "GTC") -> dict:
+        """Place (or validate) one order.
+
+        `time_in_force` matters for LIMIT entries: "IOC" fills whatever is
+        available at or through the limit price right now and cancels the rest,
+        so a marketable limit that can't fully fill never RESTS on the book as
+        an open BUY. A resting entry would desync the position book (metadata
+        says we hold it, the exchange says we don't) and make the protective
+        stop that follows fail on free balance.
+        """
         params: dict[str, Any] = {
             "symbol": pair, "side": side.upper(), "type": order_type.upper(),
             "quantity": qty,
@@ -216,7 +291,12 @@ class BinanceClient:
             if price is None:
                 raise ValueError("LIMIT orders require a price")
             params["price"] = price
-            params["timeInForce"] = "GTC"
+            params["timeInForce"] = time_in_force.upper()
+        if not test:
+            # FULL so the response carries `fills`, `executedQty` and
+            # `cummulativeQuoteQty` — needed to record the real fill, and for a
+            # LIMIT the ack-only default would omit them.
+            params["newOrderRespType"] = "FULL"
 
         path = "/api/v3/order/test" if test else "/api/v3/order"
         result = self._request("POST", path, params, signed=True)
@@ -323,9 +403,13 @@ class PaperBroker:
             held = self.holdings().get(proposal["symbol"], 0.0)
             if proposal["qty"] > held + 1e-12:
                 warn.append(f"selling {proposal['qty']:.6f} but only hold {held:.6f}")
-        if proposal["side"] == "BUY" and proposal["notional"] > self.store.paper_cash():
-            warn.append(f"notional ${proposal['notional']:,.2f} exceeds paper cash "
-                        f"${self.store.paper_cash():,.2f}")
+        if proposal["side"] == "BUY":
+            fee = commission_usd(float(proposal["notional"]), self.cfg)
+            if fee:
+                warn.append(f"est. fee ≈ ${fee:,.2f} + ~{self.cfg.fees.slippage_bps:.0f} bps slippage")
+            if proposal["notional"] + fee > self.store.paper_cash():
+                warn.append(f"notional + fee ${proposal['notional'] + fee:,.2f} exceeds paper cash "
+                            f"${self.store.paper_cash():,.2f}")
         return warn
 
     def place_protection(self, proposal: dict, record: dict) -> dict | None:
@@ -358,16 +442,26 @@ class PaperBroker:
         return self.store.mark_protective_cancelled(symbol)
 
     def execute(self, proposal: dict, run_id: str) -> dict:
-        fill = float(proposal["entry"])
+        mid = float(proposal["entry"])
         try:                                    # fill at live price when reachable
             from . import prices
             live = prices.latest_prices([proposal["symbol"]], self.cfg)
-            fill = live.get(proposal["symbol"], fill)
+            mid = live.get(proposal["symbol"], mid)
         except Exception:  # noqa: BLE001 - fall back to the proposal's entry
             pass
 
         qty = float(proposal["qty"])
-        cost = qty * fill
+        # An entry can be sent as a (marketable) limit; an exit must fill, so it
+        # is a market order and pays the full modelled spread.
+        is_entry = proposal["side"].upper() == "BUY"
+        otype = (self.cfg.execution.entry_order_type if is_entry
+                 else self.cfg.execution.order_type).upper()
+        s_bps = slippage_bps(qty * mid, self.cfg, order_type=otype)
+        fill = apply_slippage(mid, proposal["side"], s_bps)
+        comm = commission_usd(qty * fill, self.cfg,
+                              maker=(otype == "LIMIT" and not is_entry))
+        gross = qty * fill
+        cost = gross + comm                       # BUY: cash out including the fee
 
         # Approvals happen one at a time, so the slate-level cap isn't enough:
         # approving all three when only two are affordable must fail the third
@@ -381,24 +475,31 @@ class PaperBroker:
                     "proposal_id": proposal["proposal_id"], "run_id": run_id,
                     "ts": iso(), "venue": "paper", "mode": "paper",
                     "symbol": proposal["symbol"], "side": proposal["side"],
-                    "order_type": "MARKET", "qty": qty, "price": fill,
+                    "order_type": otype, "qty": qty, "price": fill,
                     "status": "REJECTED_INSUFFICIENT_CASH", "exchange_ref": None,
+                    "fee_usd": 0.0,
                     "response": json.dumps({"required": round(cost, 2),
-                                            "available": round(cash, 2)}),
+                                            "available": round(cash, 2),
+                                            "fee": round(comm, 2)}),
                 }
                 self.store.save_order(record)
-                print(f"  ✗ {proposal['symbol']}: needs ${cost:,.2f}, "
-                      f"only ${cash:,.2f} available — not filled.")
+                print(f"  ✗ {proposal['symbol']}: needs ${cost:,.2f} "
+                      f"(incl. ${comm:,.2f} fee), only ${cash:,.2f} available — not filled.")
                 return record
 
-        self.store.apply_paper_fill(proposal["symbol"], proposal["side"], qty, fill)
+        self.store.apply_paper_fill(proposal["symbol"], proposal["side"], qty,
+                                    fill, commission=comm)
         record = {
             "order_id": f"paper-{uuid.uuid4().hex[:12]}",
             "proposal_id": proposal["proposal_id"], "run_id": run_id, "ts": iso(),
             "venue": "paper", "mode": "paper", "symbol": proposal["symbol"],
-            "side": proposal["side"], "order_type": "MARKET", "qty": qty,
+            "side": proposal["side"], "order_type": otype, "qty": qty,
             "price": fill, "status": "FILLED", "exchange_ref": None,
-            "response": json.dumps({"simulated": True, "fill_price": fill}),
+            "fee_usd": round(comm, 6),
+            "response": json.dumps({"simulated": True, "fill_price": fill,
+                                    "mid": mid, "slippage_bps": round(s_bps, 2),
+                                    "fee": round(comm, 4),
+                                    "fee_bps": round(comm / gross * 10_000, 2) if gross else 0.0}),
         }
         self.store.save_order(record)
         return record
@@ -459,10 +560,32 @@ class BinanceBroker:
         except BinanceError as exc:
             warn.append(str(exc))
 
-        if proposal["side"] == "BUY":
+        notional = float(proposal["notional"])
+        is_entry = proposal["side"].upper() == "BUY"
+        otype = (self.cfg.execution.entry_order_type if is_entry
+                 else self.cfg.execution.order_type).upper()
+        fee = commission_usd(notional, self.cfg, maker=(otype == "LIMIT" and not is_entry))
+        warn.append(f"est. fee ≈ ${fee:,.2f} "
+                    f"({(self.cfg.fees.effective_maker_bps if otype == 'LIMIT' and not is_entry else self.cfg.fees.effective_taker_bps):.0f} bps)")
+
+        # Has the market moved away from the price this proposal was sized at?
+        guard = self.cfg.execution.entry_slippage_guard_bps
+        try:
+            live = self.client.price(self.pair(proposal["symbol"]))
+            drift_bps = (live / float(proposal["entry"]) - 1) * 10_000
+            if is_entry and guard > 0 and drift_bps > guard:
+                warn.append(f"price has moved +{drift_bps:.0f} bps above the proposal "
+                            f"entry (guard {guard:.0f} bps) "
+                            f"— entry will be REFUSED at execution")
+            elif abs(drift_bps) > 20:
+                warn.append(f"live price {live:,.6g} is {drift_bps:+.0f} bps vs proposal entry")
+        except Exception:  # noqa: BLE001 - price check is best-effort
+            pass
+
+        if is_entry:
             cash = self.available_cash()
-            if cash is not None and float(proposal["notional"]) > cash:
-                warn.append(f"notional ${float(proposal['notional']):,.2f} exceeds free "
+            if cash is not None and notional + fee > cash:
+                warn.append(f"notional + fee ${notional + fee:,.2f} exceeds free "
                             f"{self.cfg.execution.quote_asset} balance ${cash:,.2f}")
         else:
             held = self.holdings().get(proposal["symbol"], 0.0)
@@ -602,34 +725,102 @@ class BinanceBroker:
 
     def execute(self, proposal: dict, run_id: str) -> dict:
         pair = self.pair(proposal["symbol"])
-        use_limit = self.cfg.execution.order_type.upper() == "LIMIT"
+        ex = self.cfg.execution
+        is_entry = proposal["side"].upper() == "BUY"
+        # Entries can go as a marketable LIMIT to cap slippage; exits must fill,
+        # so they use `order_type` (MARKET by default).
+        order_type = (ex.entry_order_type if is_entry else ex.order_type).upper()
+        ref = float(proposal["entry"])
 
+        # Slippage guard: if the market has run away from the price this
+        # proposal was sized against, refuse rather than chase it. The guard is
+        # read through the property so it can never sit below the limit cross.
+        guard = ex.entry_slippage_guard_bps
+        if is_entry and guard > 0:
+            try:
+                live = self.client.price(pair)
+                drift_bps = (live / ref - 1) * 10_000
+                if drift_bps > guard:
+                    record = {
+                        "order_id": f"bnc-{uuid.uuid4().hex[:12]}",
+                        "proposal_id": proposal["proposal_id"], "run_id": run_id,
+                        "ts": iso(), "venue": self.venue,
+                        "mode": "binance-live" if self.live else "binance-test",
+                        "symbol": proposal["symbol"], "side": proposal["side"],
+                        "order_type": order_type, "qty": float(proposal["qty"]),
+                        "price": 0.0, "status": "REJECTED_SLIPPAGE", "exchange_ref": "",
+                        "fee_usd": 0.0,
+                        "response": json.dumps({"drift_bps": round(drift_bps, 1),
+                                                "guard_bps": guard,
+                                                "live": live, "proposal_entry": ref}),
+                    }
+                    self.store.save_order(record)
+                    print(f"  ✗ {proposal['symbol']}: live price +{drift_bps:.0f} bps above "
+                          f"proposal entry, past the {guard:.0f} bps guard — entry refused.")
+                    return record
+                ref = live       # price the limit off the live quote
+            except Exception:  # noqa: BLE001 - guard is best-effort
+                pass
+
+        # A marketable LIMIT entry goes IOC: it fills whatever is available at or
+        # through the limit right now and cancels the rest, so it can never rest
+        # on the book as an open BUY. Exits keep GTC.
+        tif = "IOC" if (order_type == "LIMIT" and is_entry) else "GTC"
         limit_price = None
-        if use_limit:
-            offset = self.cfg.execution.limit_offset_bps / 10_000.0
-            ref = float(proposal["entry"])
-            limit_price = ref * (1 + offset) if proposal["side"] == "BUY" else ref * (1 - offset)
+        if order_type == "LIMIT":
+            # Marketable: cross the book by entry_limit_cross_bps (entry) or
+            # limit_offset_bps (exit) so it fills promptly but never worse.
+            cross = (ex.entry_limit_cross_bps if is_entry else ex.limit_offset_bps) / 10_000.0
+            limit_price = ref * (1 + cross) if is_entry else ref * (1 - cross)
 
         qty_s, price_s, warnings = self.client.normalize_order(pair, proposal["qty"], limit_price)
+        req_qty = float(qty_s)
         test = not self.live
         client_id = f"cy{proposal['proposal_id'].replace('-', '')[:30]}"
 
+        filled_qty = req_qty            # assumed for validate-only / no-detail acks
+        fee_usd: float | None = None
+        fee_detail: dict[str, Any] = {}
         try:
             resp = self.client.place_order(
-                pair, proposal["side"], qty_s,
-                order_type=self.cfg.execution.order_type,
-                price=price_s, client_id=client_id, test=test,
+                pair, proposal["side"], qty_s, order_type=order_type,
+                price=price_s, client_id=client_id, test=test, time_in_force=tif,
             )
-            status = resp.get("status") or ("VALIDATED" if test else "SENT")
-            ref = str(resp.get("orderId") or "")
+            ref_id = str(resp.get("orderId") or "")
             fill_price = float(resp.get("price") or 0) or float(proposal["entry"])
+            executed = float(resp.get("executedQty") or 0) or 0.0
+            cquote = float(resp.get("cummulativeQuoteQty") or 0) or 0.0
+
             if resp.get("fills"):
                 fills = resp["fills"]
-                notional = sum(float(f["price"]) * float(f["qty"]) for f in fills)
-                filled_qty = sum(float(f["qty"]) for f in fills)
-                fill_price = notional / filled_qty if filled_qty else fill_price
+                gross = sum(float(f["price"]) * float(f["qty"]) for f in fills)
+                fq = sum(float(f["qty"]) for f in fills)
+                fill_price = gross / fq if fq else fill_price
+                executed = executed or fq
+                fee_usd, fee_detail = self._fills_fee_usd(
+                    fills, fill_price, proposal["symbol"])
+            elif executed and cquote:
+                fill_price = cquote / executed
+
+            if test:
+                status = "VALIDATED"
+            elif executed <= 0:
+                # IOC that matched nothing (or an ack with no fill detail).
+                status = "EXPIRED_NO_FILL"
+                filled_qty = 0.0
+                print(f"  ✗ {proposal['symbol']}: {order_type}/{tif} filled 0 "
+                      f"(no liquidity at limit {price_s}). Nothing opened.")
+            elif executed < req_qty * 0.999:
+                status = "PARTIALLY_FILLED"
+                filled_qty = executed
+                print(f"  ◐ {proposal['symbol']}: partial fill {executed:g} of "
+                      f"{req_qty:g} ({executed / req_qty:.0%}). Position sized to the fill.")
+            else:
+                status = "FILLED"
+                filled_qty = executed
         except BinanceError as exc:
-            resp, status, ref, fill_price = {"error": str(exc), "code": exc.code}, "REJECTED", "", 0.0
+            resp = {"error": str(exc), "code": exc.code}
+            status, ref_id, fill_price, filled_qty = "REJECTED", "", 0.0, 0.0
             print(f"  ✗ Binance rejected {proposal['symbol']}: {exc}")
 
         record = {
@@ -637,12 +828,52 @@ class BinanceBroker:
             "proposal_id": proposal["proposal_id"], "run_id": run_id, "ts": iso(),
             "venue": self.venue, "mode": "binance-live" if self.live else "binance-test",
             "symbol": proposal["symbol"], "side": proposal["side"],
-            "order_type": self.cfg.execution.order_type, "qty": float(qty_s),
-            "price": fill_price, "status": status, "exchange_ref": ref,
-            "response": json.dumps({"warnings": warnings, "response": resp}, default=str),
+            "order_type": order_type,
+            # The REAL filled quantity — protective orders and position metadata
+            # downstream must size to what actually executed, not what was asked.
+            "qty": float(filled_qty),
+            "price": fill_price, "status": status, "exchange_ref": ref_id,
+            # Realised fee, or None when unknown (validate-only, BNB-paid, or a
+            # rejected order) so evaluation can tell "0 fee" from "not known".
+            "fee_usd": (0.0 if is_rejected(status)
+                        else (round(fee_usd, 6) if fee_usd is not None else None)),
+            "response": json.dumps({"warnings": warnings, "limit_price": price_s,
+                                    "tif": tif, "requested_qty": req_qty,
+                                    "executed_qty": filled_qty,
+                                    **({"fee": round(fee_usd, 6)} if fee_usd is not None else {}),
+                                    **({"fee_detail": fee_detail} if fee_detail else {}),
+                                    "response": resp}, default=str),
         }
         self.store.save_order(record)
         return record
+
+    def _fills_fee_usd(self, fills: list[dict], fill_price: float,
+                       base_asset: str) -> tuple[float | None, dict]:
+        """Sum the real commission from a FULL order response, in quote currency.
+
+        Binance reports commission in whatever asset it charged: the quote asset
+        (already USD-ish), the base asset (convert at the fill price), or BNB
+        (no price to hand — report the raw amounts and let evaluation fall back
+        to the modelled rate).
+        """
+        stable = {self.cfg.execution.quote_asset, "USDT", "USDC", "USD", "BUSD", "DAI"}
+        by_asset: dict[str, float] = {}
+        for f in fills:
+            a = f.get("commissionAsset")
+            if a:
+                by_asset[a] = by_asset.get(a, 0.0) + float(f.get("commission") or 0.0)
+        if not by_asset:
+            return None, {}
+        usd = 0.0
+        convertible = True
+        for asset, amt in by_asset.items():
+            if asset in stable:
+                usd += amt
+            elif asset == base_asset:
+                usd += amt * fill_price
+            else:
+                convertible = False              # BNB or something exotic
+        return (usd if convertible else None), by_asset
 
 
 def get_broker(store: Store, cfg: Config = CONFIG):

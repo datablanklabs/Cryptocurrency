@@ -183,6 +183,7 @@ def score_chart(scores: pd.DataFrame, template: str = "plotly_white") -> go.Figu
         ("w_social", "#ff7f00", "Social"),
         ("w_catalyst", "#4daf4a", "Catalyst"),
         ("w_positioning", "#984ea3", "Positioning"),
+        ("w_events", "#e41a1c", "Events"),
     ):
         if col in df:
             fig.add_trace(go.Bar(y=df["symbol"], x=df[col], name=label,

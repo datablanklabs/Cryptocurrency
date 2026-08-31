@@ -19,10 +19,14 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from .broker import execution_banner
+from .broker import execution_banner, is_rejected
 from .config import CONFIG, Config
 from .engine import fmt_price, fmt_qty
+from .logsetup import get_logger
+from .notify import notify
 from .store import Store, iso
+
+_log = get_logger("approval")
 
 APPROVE = {"y", "yes", "a", "approve"}
 REJECT = {"n", "no", "r", "reject", ""}
@@ -105,15 +109,17 @@ def request_approval(proposals: pd.DataFrame, cfg: Config = CONFIG,
         else:
             move_pct = (p["target"] - p["entry"]) / p["entry"] * 100
             stop_pct = (p["stop"] - p["entry"]) / p["entry"] * 100
+            rr_net = p.get("reward_risk_net", p["reward_risk"])
+            fee = p.get("fee_est", 0.0)
             print(f"#{p['rank']}  {p['side']} {p['symbol']}   "
                   f"composite {p['composite']:+.3f}   horizon {p['horizon']}")
             print(f"{'─' * 78}")
             print(f"  entry   {fmt_price(p['entry']):>18}")
             print(f"  stop    {fmt_price(p['stop']):>18}   ({stop_pct:+.2f}%)")
             print(f"  target  {fmt_price(p['target']):>18}   ({move_pct:+.2f}%)   "
-                  f"R:R {p['reward_risk']:.2f}")
+                  f"R:R {p['reward_risk']:.2f} gross / {rr_net:.2f} net")
             print(f"  size    {fmt_qty(p['qty']):>18} {p['symbol']}   ≈ ${p['notional']:,.2f}"
-                  f"   risk ≈ ${p['risk_usd']:,.2f}")
+                  f"   risk ≈ ${p['risk_usd']:,.2f}   fee ≈ ${fee:,.2f}/side")
         print(f"\n  {p['rationale']}")
 
         warns = (preflight or {}).get(p["proposal_id"], [])
@@ -201,7 +207,7 @@ def _sync_position_meta(proposal, record: dict, broker, store: Store,
     SELL that flattens the position clears the row so a future re-entry starts
     a fresh clock and high-water mark rather than inheriting stale terms.
     """
-    if record.get("status") in {"REJECTED", "REJECTED_INSUFFICIENT_CASH"}:
+    if is_rejected(record.get("status")):
         return
     symbol = record["symbol"]
 
@@ -251,17 +257,37 @@ def execute_approved(proposals: pd.DataFrame, broker, store: Store, run_id: str,
         record = broker.execute(p.to_dict(), run_id)
         _sync_position_meta(p, record, broker, store, cfg)
 
-        mark = "✓" if record["status"] not in {"REJECTED"} else "✗"
+        rejected = is_rejected(record["status"])
+        is_exit = p.get("kind") == "exit"
+        mark = "✗" if rejected else "✓"
         print(f"  {mark} {record['side']:<4} {record['symbol']:<6} "
               f"qty={record['qty']:<14.6f} @ {record['price']:<12,.4f} "
               f"[{record['status']} · {record['mode']}]")
+        _log.info("%s %s qty=%.6f @ %.6f [%s · %s]", record["side"],
+                  record["symbol"], record["qty"], record["price"],
+                  record["status"], record["mode"])
+
+        if rejected and cfg.notify.on_rejection:
+            notify(f"{record['symbol']} order rejected",
+                   f"{record['side']} {record['symbol']} — {record['status']} "
+                   f"[{record['mode']}]", cfg, tag="rejected")
+        elif not rejected and is_exit and cfg.notify.on_exit_trigger:
+            notify(f"{record['symbol']} exit filled — {p.get('trigger', 'exit')}",
+                   f"sold {record['qty']:g} {record['symbol']} @ "
+                   f"{record['price']:,.4f} [{record['mode']}]", cfg, tag="warning")
+        elif not rejected and cfg.notify.on_execution:
+            notify(f"{record['symbol']} {record['side']} filled",
+                   f"{record['qty']:g} @ {record['price']:,.4f} [{record['mode']}]",
+                   cfg, tag="info")
 
         if (p["side"].upper() == "BUY"
-                and record.get("status") not in {"REJECTED", "REJECTED_INSUFFICIENT_CASH"}
+                and not rejected
                 and hasattr(broker, "place_protection")):
             try:
                 broker.place_protection(p.to_dict(), record)
             except Exception as exc:  # noqa: BLE001 - entry stands, protection didn't
+                _log.exception("%s: protective order failed after entry fill",
+                               p["symbol"])
                 print(f"    ⚠ {p['symbol']}: entry filled but protective order failed "
                       f"({exc}). Position is UNPROTECTED between runs.")
         results.append({

@@ -89,6 +89,7 @@ CREATE TABLE IF NOT EXISTS scores (
     ts            TEXT NOT NULL,
     symbol        TEXT NOT NULL,
     technical     REAL, social REAL, catalyst REAL, composite REAL,
+    positioning   REAL, events REAL, xsec REAL,
     components    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_scores_run ON scores(run_id);
@@ -123,6 +124,10 @@ CREATE TABLE IF NOT EXISTS orders (
     price         REAL,
     status        TEXT,
     exchange_ref  TEXT,
+    -- Realised commission in quote currency, first-class so fee analytics
+    -- don't have to parse the response blob. NULL = not known (old rows, or a
+    -- BNB-paid fee we couldn't convert) -> evaluation falls back to an estimate.
+    fee_usd       REAL,
     response      TEXT
 );
 
@@ -207,6 +212,53 @@ CREATE TABLE IF NOT EXISTS source_rank (
     items_per_hour REAL,
     n_items        INTEGER
 );
+
+-- One row per completed cycle: the mark-to-market value of the book. This is
+-- the raw material for an equity curve, for Sharpe / max-drawdown, and for the
+-- only comparison that matters — did this beat holding BTC? Nothing else in the
+-- schema records total equity over time, so without this the engine cannot be
+-- scored on return at all, only on individual proposals.
+CREATE TABLE IF NOT EXISTS equity_snapshots (
+    run_id          TEXT,
+    ts              TEXT NOT NULL,
+    mode            TEXT,
+    cash            REAL,
+    positions_value REAL,
+    equity          REAL,
+    PRIMARY KEY (ts, mode)
+);
+CREATE INDEX IF NOT EXISTS idx_equity_ts ON equity_snapshots(ts);
+
+-- The regime verdict at each cycle, so its own effect can be measured later:
+-- "did blocking / scaling down in risk_off actually precede weaker returns?"
+CREATE TABLE IF NOT EXISTS regime_log (
+    run_id         TEXT,
+    ts             TEXT NOT NULL,
+    symbol         TEXT,
+    state          TEXT,
+    exposure_scale REAL,
+    pct_vs_ma      REAL,
+    ma_slope_pct   REAL,
+    drawdown_pct   REAL,
+    note           TEXT,
+    PRIMARY KEY (run_id)
+);
+CREATE INDEX IF NOT EXISTS idx_regime_ts ON regime_log(ts);
+
+-- Point-in-time daily closes, one row per (symbol, UTC date). Written every
+-- cycle from the 1y candles `build_scores` already fetches. `evaluation` reads
+-- forward returns from THIS table rather than re-pulling a sliding window from a
+-- live API on every call, which is what makes its IC / Sharpe / benchmark
+-- numbers reproducible and lets the whole module run with no network.
+CREATE TABLE IF NOT EXISTS prices_daily (
+    symbol     TEXT NOT NULL,
+    date       TEXT NOT NULL,          -- 'YYYY-MM-DD' (UTC)
+    close      REAL NOT NULL,
+    source     TEXT,
+    fetched_at TEXT NOT NULL,
+    PRIMARY KEY (symbol, date)
+);
+CREATE INDEX IF NOT EXISTS idx_prices_daily_symbol ON prices_daily(symbol, date);
 """
 
 
@@ -264,6 +316,18 @@ class Store:
             if "source" not in cols:
                 con.execute(
                     f"ALTER TABLE {table} ADD COLUMN source TEXT NOT NULL DEFAULT 'reddit'")
+
+        # Families added after the scores table was first shipped. Old rows keep
+        # NULL here; `evaluation` falls back to parsing the components JSON for
+        # them, so nothing is lost, but new rows get clean columns.
+        score_cols = {r["name"] for r in con.execute("PRAGMA table_info(scores)")}
+        for col in ("positioning", "events", "xsec"):
+            if col not in score_cols:
+                con.execute(f"ALTER TABLE scores ADD COLUMN {col} REAL")
+
+        order_cols = {r["name"] for r in con.execute("PRAGMA table_info(orders)")}
+        if "fee_usd" not in order_cols:
+            con.execute("ALTER TABLE orders ADD COLUMN fee_usd REAL")
 
     def _init_schema(self) -> None:
         with self.conn() as con:
@@ -405,6 +469,8 @@ class Store:
                 "run_id": run_id, "ts": ts, "symbol": r["symbol"],
                 "technical": r.get("technical"), "social": r.get("social"),
                 "catalyst": r.get("catalyst"), "composite": r.get("composite"),
+                "positioning": r.get("positioning"), "events": r.get("events"),
+                "xsec": r.get("xsec"),
                 "components": json.dumps(r.get("components", {}), default=str),
             }
             for r in rows
@@ -412,9 +478,9 @@ class Store:
         with self.conn() as con:
             con.executemany(
                 """INSERT INTO scores(run_id, ts, symbol, technical, social,
-                        catalyst, composite, components)
+                        catalyst, composite, positioning, events, xsec, components)
                    VALUES (:run_id,:ts,:symbol,:technical,:social,:catalyst,
-                           :composite,:components)""",
+                           :composite,:positioning,:events,:xsec,:components)""",
                 payload,
             )
 
@@ -441,21 +507,24 @@ class Store:
             )
 
     def save_order(self, row: dict[str, Any]) -> None:
+        row = {"fee_usd": None, **row}
         with self.conn() as con:
             con.execute(
                 """INSERT OR REPLACE INTO orders
                    (order_id, proposal_id, run_id, ts, venue, mode, symbol, side,
-                    order_type, qty, price, status, exchange_ref, response)
+                    order_type, qty, price, status, exchange_ref, fee_usd, response)
                    VALUES (:order_id,:proposal_id,:run_id,:ts,:venue,:mode,:symbol,
-                           :side,:order_type,:qty,:price,:status,:exchange_ref,:response)""",
+                           :side,:order_type,:qty,:price,:status,:exchange_ref,
+                           :fee_usd,:response)""",
                 row,
             )
 
     def recent_orders(self, limit: int = 25) -> pd.DataFrame:
         with self.conn() as con:
             return pd.read_sql_query(
-                "SELECT ts, mode, venue, symbol, side, order_type, qty, price, status "
-                "FROM orders ORDER BY ts DESC LIMIT ?", con, params=(limit,),
+                "SELECT ts, mode, venue, symbol, side, order_type, qty, price, "
+                "fee_usd, status FROM orders ORDER BY ts DESC LIMIT ?",
+                con, params=(limit,),
             )
 
     def proposal_history(self, limit: int = 50) -> pd.DataFrame:
@@ -465,6 +534,54 @@ class Store:
                 "notional, decision FROM proposals ORDER BY ts DESC LIMIT ?",
                 con, params=(limit,),
             )
+
+    def scores_history(self, since: datetime | None = None) -> pd.DataFrame:
+        """Every stored score row, for the evaluation module. Newest last."""
+        q = ("SELECT run_id, ts, symbol, technical, social, catalyst, "
+             "positioning, events, xsec, composite, components FROM scores")
+        params: tuple = ()
+        if since is not None:
+            q += " WHERE ts >= ?"
+            params = (since.isoformat(),)
+        with self.conn() as con:
+            df = pd.read_sql_query(q + " ORDER BY ts ASC", con, params=params)
+        if not df.empty:
+            df["ts"] = pd.to_datetime(df["ts"], utc=True, format="ISO8601")
+        return df
+
+    def all_orders(self) -> pd.DataFrame:
+        """Full order log, oldest first — for realised-trade reconstruction."""
+        with self.conn() as con:
+            df = pd.read_sql_query(
+                "SELECT ts, run_id, mode, venue, symbol, side, order_type, qty, "
+                "price, status, fee_usd, response FROM orders ORDER BY ts ASC", con)
+        if not df.empty:
+            df["ts"] = pd.to_datetime(df["ts"], utc=True, format="ISO8601")
+        return df
+
+    # -- regime log -------------------------------------------------------
+    def record_regime(self, run_id: str, regime: dict[str, Any]) -> None:
+        """One row per cycle capturing the regime verdict it acted on."""
+        with self.conn() as con:
+            con.execute(
+                """INSERT OR REPLACE INTO regime_log
+                   (run_id, ts, symbol, state, exposure_scale, pct_vs_ma,
+                    ma_slope_pct, drawdown_pct, note)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (run_id, iso(), regime.get("symbol"), regime.get("state"),
+                 regime.get("exposure_scale"), regime.get("pct_vs_ma"),
+                 regime.get("ma_slope_pct"), regime.get("drawdown_from_high_pct"),
+                 regime.get("note")),
+            )
+
+    def regime_history(self) -> pd.DataFrame:
+        with self.conn() as con:
+            df = pd.read_sql_query(
+                "SELECT run_id, ts, symbol, state, exposure_scale, pct_vs_ma, "
+                "ma_slope_pct, drawdown_pct, note FROM regime_log ORDER BY ts ASC", con)
+        if not df.empty:
+            df["ts"] = pd.to_datetime(df["ts"], utc=True, format="ISO8601")
+        return df
 
     # -- position metadata --------------------------------------------------
     def upsert_position_meta(self, row: dict[str, Any]) -> None:
@@ -650,8 +767,17 @@ class Store:
         with self.conn() as con:
             return pd.read_sql_query("SELECT * FROM paper_positions", con)
 
-    def apply_paper_fill(self, symbol: str, side: str, qty: float, price: float) -> None:
-        """Average-cost bookkeeping for the simulated book."""
+    def apply_paper_fill(self, symbol: str, side: str, qty: float, price: float,
+                         commission: float = 0.0) -> None:
+        """Average-cost bookkeeping for the simulated book.
+
+        `commission` is the trading fee in quote currency. It is always a debit
+        (both BUY and SELL cost fees) and is kept OUT of the position's average
+        cost - it reduces cash directly, the way an exchange charges it - so the
+        book's realised P&L and the equity curve both reflect real trading
+        costs. `price` is the effective fill price and should already include
+        modelled slippage; the caller (PaperBroker) applies both.
+        """
         with self.conn() as con:
             row = con.execute(
                 "SELECT qty, avg_price FROM paper_positions WHERE symbol=?", (symbol,)
@@ -680,5 +806,94 @@ class Store:
             cash = float(con.execute("SELECT balance FROM paper_cash WHERE id=1").fetchone()["balance"])
             con.execute(
                 "UPDATE paper_cash SET balance=? WHERE id=1",
-                (cash - signed * price,),
+                (cash - signed * price - abs(commission),),
             )
+
+    # -- equity curve -----------------------------------------------------
+    def record_equity(self, run_id: str | None, cash: float | None,
+                      positions_value: float, equity: float | None,
+                      mode: str = "paper") -> None:
+        """Append (or replace) this cycle's mark-to-market equity snapshot."""
+        with self.conn() as con:
+            con.execute(
+                """INSERT INTO equity_snapshots
+                   (run_id, ts, mode, cash, positions_value, equity)
+                   VALUES (?,?,?,?,?,?)
+                   ON CONFLICT(ts, mode) DO UPDATE SET
+                     run_id=excluded.run_id, cash=excluded.cash,
+                     positions_value=excluded.positions_value,
+                     equity=excluded.equity""",
+                (run_id, iso(), mode, cash, positions_value, equity),
+            )
+
+    def equity_curve(self, mode: str | None = None) -> pd.DataFrame:
+        q = "SELECT ts, mode, cash, positions_value, equity FROM equity_snapshots"
+        params: tuple = ()
+        if mode:
+            q += " WHERE mode = ?"
+            params = (mode,)
+        with self.conn() as con:
+            df = pd.read_sql_query(q + " ORDER BY ts ASC", con, params=params)
+        if not df.empty:
+            df["ts"] = pd.to_datetime(df["ts"], utc=True, format="ISO8601")
+        return df
+
+    # -- point-in-time daily prices --------------------------------------
+    def upsert_daily_prices(self, rows: Iterable[dict[str, Any]]) -> int:
+        """Insert/update daily close rows. Keys: symbol, date, close, source,
+        fetched_at."""
+        rows = list(rows)
+        if not rows:
+            return 0
+        with self.conn() as con:
+            cur = con.executemany(
+                """INSERT INTO prices_daily(symbol, date, close, source, fetched_at)
+                   VALUES (:symbol,:date,:close,:source,:fetched_at)
+                   ON CONFLICT(symbol, date) DO UPDATE SET
+                     close=excluded.close, source=excluded.source,
+                     fetched_at=excluded.fetched_at""",
+                rows,
+            )
+            return cur.rowcount
+
+    def upsert_daily_prices_from_series(self, symbol: str, close: Any,
+                                       source: str = "") -> int:
+        """Persist a close series (any DatetimeIndex) as one row per UTC date.
+
+        The last close of each calendar day wins, so a daily-candle series maps
+        1:1 while an intraday one still collapses cleanly. This is the single
+        writer used by both `engine.build_scores` (every cycle) and the one-off
+        `backfill_prices.py`.
+        """
+        s = pd.Series(close).dropna()
+        if s.empty:
+            return 0
+        idx = pd.DatetimeIndex(pd.to_datetime(s.index, utc=True))
+        s = pd.Series(s.to_numpy(dtype=float), index=idx).sort_index()
+        daily = s.groupby(s.index.strftime("%Y-%m-%d")).last()
+        fetched = iso()
+        rows = [{"symbol": symbol, "date": str(d), "close": float(v),
+                 "source": source or None, "fetched_at": fetched}
+                for d, v in daily.items()]
+        return self.upsert_daily_prices(rows)
+
+    def daily_prices(self, symbol: str | None = None) -> pd.DataFrame:
+        """Stored daily closes, oldest first. `date` is a tz-aware datetime."""
+        q = "SELECT symbol, date, close, source FROM prices_daily"
+        params: tuple = ()
+        if symbol:
+            q += " WHERE symbol = ?"
+            params = (symbol,)
+        with self.conn() as con:
+            df = pd.read_sql_query(q + " ORDER BY symbol, date ASC", con, params=params)
+        if not df.empty:
+            df["date"] = pd.to_datetime(df["date"], utc=True)
+        return df
+
+    def daily_price_coverage(self) -> pd.DataFrame:
+        """One row per symbol: how many days are stored and the date span."""
+        with self.conn() as con:
+            return pd.read_sql_query(
+                "SELECT symbol, COUNT(*) AS days, MIN(date) AS first, "
+                "MAX(date) AS last FROM prices_daily GROUP BY symbol ORDER BY symbol",
+                con)

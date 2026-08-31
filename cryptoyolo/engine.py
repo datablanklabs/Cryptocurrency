@@ -25,7 +25,6 @@ from __future__ import annotations
 import json
 import math
 import uuid
-from datetime import datetime, timezone
 from typing import Any
 
 import numpy as np
@@ -36,7 +35,7 @@ from . import indicators, prices
 from . import positioning as positioning_mod
 from . import social as social_mod
 from .config import CONFIG, Config
-from .store import Store, iso, utcnow
+from .store import Store, iso
 
 
 def _clip(x: float, lo: float = -1.0, hi: float = 1.0) -> float:
@@ -117,35 +116,89 @@ def technical_score(short: dict[str, float], medium: dict[str, float]) -> tuple[
 # --------------------------------------------------------------------------
 # Assembly
 # --------------------------------------------------------------------------
+def _xsec_momentum(rows: list[dict[str, Any]]) -> dict[str, float]:
+    """Cross-sectional trailing-return z-score, squashed to [-1, 1].
+
+    The isolated technical score only ever looks at an asset against its own
+    history. Cross-sectional momentum - "how is this asset doing *relative to
+    the other 19*" - is one of the few crypto factors that survives contact
+    with out-of-sample data, and it needs the whole cross-section to compute.
+    Blend weight is `ScoreWeights.xsec_momentum_blend`.
+    """
+    raw: dict[str, float] = {}
+    for r in rows:
+        snap = r["components"].get("snapshot_daily", {})
+        # 24 and 72 daily bars ~= 1-month and 3-month return.
+        m1 = float(snap.get("ret_24b", 0.0) or 0.0)
+        m3 = float(snap.get("ret_72b", 0.0) or 0.0)
+        raw[r["symbol"]] = 0.5 * m1 + 0.5 * m3
+    # Standardise against the CONFIGURED universe only. A position you happen to
+    # hold that sits outside the universe shouldn't shift the rank everyone else
+    # is measured on - it still gets a score, just doesn't define the scale.
+    universe_syms = {r["symbol"] for r in rows if not r.get("held_only")}
+    ref = np.array([v for k, v in raw.items() if k in universe_syms], dtype=float)
+    if ref.size < 3:
+        ref = np.array(list(raw.values()), dtype=float)
+    if ref.size < 3 or not np.isfinite(ref).any():
+        return {k: 0.0 for k in raw}
+    mu, sd = float(np.nanmean(ref)), float(np.nanstd(ref))
+    if sd < 1e-9:
+        return {k: 0.0 for k in raw}
+    return {k: _squash((v - mu) / sd, 1.0) for k, v in raw.items()}
+
+
 def build_scores(store: Store, cfg: Config = CONFIG, verbose: bool = True,
                  extra_symbols: list[str] | None = None) -> pd.DataFrame:
-    """Compute technical/social/catalyst/composite scores.
+    """Compute technical/social/catalyst/positioning/events/composite scores.
 
     `extra_symbols` covers assets you hold that are not in the configured
     universe. Without it those positions are never scored, so no exit signal can
     ever be produced for them - they would be silently unsellable by the engine.
+
+    Two structural notes:
+      * the composite is assembled AFTER the per-asset loop, because the
+        technical score is blended with a cross-sectional momentum rank that
+        needs every asset scored first;
+      * `events` is a fifth family (scheduled dated catalysts) added the same
+        way `positioning` was - it makes room without rescaling the others.
     """
     social_df = social_mod.score_symbols(store, cfg).set_index("symbol")
     catalyst_df = catalysts_mod.score_symbols(store, cfg).set_index("symbol")
     pos_df = positioning_mod.score_symbols(store, cfg).set_index("symbol")
+    try:
+        from . import calendar_events as events_mod
+        events_df = events_mod.score_symbols(store, cfg).set_index("symbol")
+    except Exception as exc:  # noqa: BLE001 - events are optional; never fatal
+        if verbose:
+            print(f"  events family unavailable ({exc})")
+        events_df = pd.DataFrame().set_index(pd.Index([], name="symbol"))
     weights = cfg.weights.normalized()
+    blend = max(0.0, min(1.0, cfg.weights.xsec_momentum_blend))
 
     universe = set(cfg.symbols)
     targets = list(cfg.symbols) + [s for s in (extra_symbols or []) if s not in universe]
 
     rows: list[dict[str, Any]] = []
+    price_sources: set[str] = set()
     for symbol in targets:
         try:
-            short_raw, _ = prices.get_ohlcv(symbol, "1d", cfg)
-            med_raw, _ = prices.get_ohlcv(symbol, "1w", cfg)
+            short_raw, s_src = prices.get_ohlcv(symbol, "1d", cfg)
+            med_raw, m_src = prices.get_ohlcv(symbol, "1w", cfg)
             # Daily candles. Needed for stop sizing: ATR on the 1w view is the
             # range of a *1-hour* bar, which for a multi-day hold produces stops
             # under 1% that get taken out by ordinary intraday noise.
-            long_raw, _ = prices.get_ohlcv(symbol, "1y", cfg)
+            long_raw, l_src = prices.get_ohlcv(symbol, "1y", cfg)
         except Exception as exc:  # noqa: BLE001 - drop the asset, note why
             if verbose:
                 print(f"  {symbol}: no price data ({exc})")
             continue
+        price_sources.update((s_src, m_src, l_src))
+        # Record the daily closes we just fetched so `evaluation` can score this
+        # run against a fixed local price record later (see prices_daily).
+        try:
+            store.upsert_daily_prices_from_series(symbol, long_raw["close"], l_src)
+        except Exception:  # noqa: BLE001 - persistence is best-effort, never fatal
+            pass
 
         short = indicators.summarize(indicators.enrich(short_raw, cfg.bands))
         medium = indicators.summarize(indicators.enrich(med_raw, cfg.bands))
@@ -153,18 +206,18 @@ def build_scores(store: Store, cfg: Config = CONFIG, verbose: bool = True,
         if not short or not medium:
             continue
 
-        tech, tech_parts = technical_score(short, medium)
+        tech_raw, tech_parts = technical_score(short, medium)
         soc = float(social_df.loc[symbol, "social"]) if symbol in social_df.index else 0.0
         cat = float(catalyst_df.loc[symbol, "catalyst"]) if symbol in catalyst_df.index else 0.0
         pos = float(pos_df.loc[symbol, "positioning"]) if symbol in pos_df.index else 0.0
-        composite = (weights.technical * tech + weights.social * soc
-                     + weights.catalyst * cat + weights.positioning * pos)
+        evt = float(events_df.loc[symbol, "events"]) if symbol in events_df.index else 0.0
 
         components = {
             "technical_parts": tech_parts,
             "social": social_df.loc[symbol].to_dict() if symbol in social_df.index else {},
             "catalyst": catalyst_df.loc[symbol].to_dict() if symbol in catalyst_df.index else {},
             "positioning": pos_df.loc[symbol].to_dict() if symbol in pos_df.index else {},
+            "events": events_df.loc[symbol].to_dict() if symbol in events_df.index else {},
             "snapshot_1d": short,
             "snapshot_1w": medium,
             "snapshot_daily": daily,
@@ -173,15 +226,11 @@ def build_scores(store: Store, cfg: Config = CONFIG, verbose: bool = True,
         rows.append({
             "symbol": symbol,
             "held_only": symbol not in universe,
-            "technical": round(tech, 4),
+            "technical_raw": round(tech_raw, 4),
             "social": round(soc, 4),
             "catalyst": round(cat, 4),
             "positioning": round(pos, 4),
-            "composite": round(composite, 4),
-            "w_technical": round(weights.technical * tech, 4),
-            "w_social": round(weights.social * soc, 4),
-            "w_catalyst": round(weights.catalyst * cat, 4),
-            "w_positioning": round(weights.positioning * pos, 4),
+            "events": round(evt, 4),
             "price": round(medium["close"], 6),
             "atr_pct_1w": round(medium.get("atr_pct", 0.0), 5),
             "atr_pct_daily": round(daily.get("atr_pct", medium.get("atr_pct", 0.02)), 5),
@@ -193,8 +242,33 @@ def build_scores(store: Store, cfg: Config = CONFIG, verbose: bool = True,
             "components": components,
         })
 
+    if not rows:
+        return pd.DataFrame()
+
+    # --- cross-sectional momentum blend, then the composite ---------------
+    xsec = _xsec_momentum(rows)
+    for r in rows:
+        xz = xsec.get(r["symbol"], 0.0)
+        tech = _clip((1.0 - blend) * r["technical_raw"] + blend * xz)
+        composite = (weights.technical * tech + weights.social * r["social"]
+                     + weights.catalyst * r["catalyst"]
+                     + weights.positioning * r["positioning"]
+                     + weights.events * r["events"])
+        r["xsec"] = round(xz, 4)
+        r["technical"] = round(tech, 4)
+        r["composite"] = round(composite, 4)
+        r["w_technical"] = round(weights.technical * tech, 4)
+        r["w_social"] = round(weights.social * r["social"], 4)
+        r["w_catalyst"] = round(weights.catalyst * r["catalyst"], 4)
+        r["w_positioning"] = round(weights.positioning * r["positioning"], 4)
+        r["w_events"] = round(weights.events * r["events"], 4)
+        r["components"]["xsec_momentum"] = xz
+
     df = pd.DataFrame(rows).sort_values("composite", ascending=False).reset_index(drop=True)
     df.attrs["social_ready"] = bool(social_df.attrs.get("baseline_ready", False)) if hasattr(social_df, "attrs") else False
+    # Which price feeds actually answered this run, so the pipeline can flag a
+    # full fall-through to the yfinance backstop.
+    df.attrs["price_sources"] = sorted(s for s in price_sources if s)
     return df
 
 
@@ -212,7 +286,8 @@ def _rationale(row: pd.Series, side: str, cfg: Config) -> str:
     drivers = sorted(
         [("technical", row["w_technical"]), ("social", row["w_social"]),
          ("catalyst", row["w_catalyst"]),
-         ("positioning", row.get("w_positioning", 0.0))],
+         ("positioning", row.get("w_positioning", 0.0)),
+         ("events", row.get("w_events", 0.0))],
         key=lambda kv: abs(kv[1]), reverse=True,
     )
     lead, lead_val = drivers[0]
@@ -222,6 +297,9 @@ def _rationale(row: pd.Series, side: str, cfg: Config) -> str:
         bits.append(f"Trend {tp['trend']:+.2f} (price {snap.get('dist_sma_20', 0)*100:+.1f}% vs SMA20).")
     if abs(tp.get("momentum", 0)) > 0.15:
         bits.append(f"Momentum {tp['momentum']:+.2f}.")
+    if abs(row.get("xsec", 0.0)) > 0.25:
+        rank_word = "leading" if row.get("xsec", 0.0) > 0 else "lagging"
+        bits.append(f"Cross-sectional momentum {row['xsec']:+.2f} ({rank_word} the universe).")
     bits.append(f"RSI(1w) {snap.get('rsi_14', 50):.0f}, %B {snap.get('bb_pctb', 0.5):.2f}.")
     if tp.get("squeeze"):
         bits.append("Bollinger squeeze active — expansion more likely, direction not implied by it.")
@@ -254,6 +332,13 @@ def _rationale(row: pd.Series, side: str, cfg: Config) -> str:
             f"{stance}, read contrarian."
         )
 
+    ev = c.get("events", {})
+    if ev and ev.get("next_event"):
+        bits.append(
+            f"Scheduled: {ev.get('next_event', '')} in {ev.get('days_to_event', 0):.0f}d "
+            f"(magnitude {ev.get('magnitude', 0):.2f}) — events score {row.get('events', 0):+.2f}."
+        )
+
     if side == "SELL":
         bits.append("Bearish score on an existing holding — proposed as an exit, not a short.")
     return " ".join(bits)
@@ -265,7 +350,9 @@ def _rationale(row: pd.Series, side: str, cfg: Config) -> str:
 def propose(scores: pd.DataFrame, store: Store, run_id: str, cfg: Config = CONFIG,
             holdings: dict[str, float] | None = None,
             cash_available: float | None = None,
-            exit_signals: pd.DataFrame | None = None) -> pd.DataFrame:
+            exit_signals: pd.DataFrame | None = None,
+            equity_override: float | None = None,
+            regime: dict[str, Any] | None = None) -> pd.DataFrame:
     """Turn scores into at most `cfg.risk.max_proposals` sized trade candidates.
 
     Sizing is risk-first: the stop distance comes from ATR, and quantity is set
@@ -273,31 +360,65 @@ def propose(scores: pd.DataFrame, store: Store, run_id: str, cfg: Config = CONFI
     fixed dollar amount per trade, which silently takes far more risk on
     volatile names.
 
+    `equity_override` is live equity (cash + marked-to-market positions). When
+    `risk.size_off_live_equity` is on and this is provided, it replaces the
+    static `account_equity_usd` as the risk basis, so the book compounds after
+    a good stretch and de-risks in a drawdown without a config edit.
+
+    `regime` is the output of `regime.assess()`. When `regime.enabled`, its
+    `exposure_scale` multiplies the deployment cap and, in a hard downtrend, new
+    BUY entries are dropped entirely. Exits are never gated by regime.
+
     `exit_signals` (from exits.evaluate) are emitted first, into their own
-    reserved slots, and are NOT subject to `min_composite_score` - a stop that
-    has already been hit is a fact about the position, not an opinion about its
-    ranking. Entries then fill the remaining `max_proposals` budget, so exits and
-    entries never compete for the same slots.
+    reserved slots, and are NOT subject to the score threshold - a stop that has
+    already been hit is a fact about the position, not an opinion about its
+    ranking. Entries then fill the remaining `max_proposals` budget.
 
     `cash_available` is the real spendable balance (paper cash, or the free
     quote-asset balance on Binance). Total BUY notional is capped to it, so the
-    slate can never propose spending money that isn't there - `account_equity_usd`
-    is only the *risk basis* and may be larger than what's actually liquid.
-    Pass None when the balance can't be read; the cap is then skipped rather
-    than guessed, and preflight still warns per-trade.
+    slate can never propose spending money that isn't there. Pass None when the
+    balance can't be read; the cap is then skipped rather than guessed.
 
-    SELLs are exempt from both the cash cap and the deployment cap: an exit
-    releases capital rather than consuming it.
+    SELLs are exempt from the cash cap, the deployment cap and the regime gate:
+    an exit releases capital and reduces risk.
     """
     risk = cfg.risk
     holdings = holdings or {}
+
+    # Risk basis: live equity if we have it and the flag is on, else the static
+    # configured figure. Never zero — an unreadable balance falls back, it does
+    # not disable sizing.
+    risk_equity = risk.account_equity_usd
+    if risk.size_off_live_equity and equity_override and equity_override > 0:
+        risk_equity = float(equity_override)
+
+    # Regime gate.
+    deploy_scale = 1.0
+    block_buys = False
+    regime_state = "n/a"
+    if regime and cfg.regime.enabled:
+        regime_state = str(regime.get("state", "n/a"))
+        deploy_scale = float(regime.get("exposure_scale", 1.0))
+        if regime_state == "risk_off" and cfg.regime.block_new_entries_when_risk_off:
+            block_buys = True
+
+    relative = risk.selection_mode == "relative"
+    entry_floor = risk.min_composite_floor if relative else risk.min_composite_score
+    # A held asset is only trimmed on the buy-side scoreboard once it is at
+    # least this bearish - deliberately wider than entry_floor so a -0.04 blip
+    # doesn't churn fees. A genuine reversal is force-exited by exits.py.
+    trim_floor = max(risk.trim_threshold, entry_floor)
+    # Full round-trip drag (fees + slippage, both legs) as a price fraction.
+    rt_cost_frac = cfg.fees.round_trip_cost_bps / 10_000.0
 
     def _empty(reason: dict) -> pd.DataFrame:
         df = pd.DataFrame()
         df.attrs["skipped"] = reason
         df.attrs["cash_available"] = cash_available
         df.attrs["min_notional_usd"] = risk.min_notional_usd
-        df.attrs["min_composite_score"] = risk.min_composite_score
+        df.attrs["min_composite_score"] = entry_floor
+        df.attrs["risk_equity"] = risk_equity
+        df.attrs["regime"] = regime_state
         return df
 
     if scores.empty:
@@ -310,7 +431,8 @@ def propose(scores: pd.DataFrame, store: Store, run_id: str, cfg: Config = CONFI
     # earlier version blamed the score threshold even when the real blocker was
     # an empty wallet, which is a misdiagnosis, not a shortcut.
     skipped: dict[str, int] = {"below_score": 0, "bearish_unheld": 0,
-                               "below_min_notional": 0, "flagged_for_exit": 0}
+                               "below_min_notional": 0, "flagged_for_exit": 0,
+                               "regime_blocked": 0}
     # Every symbol under an exit signal, whether or not the exit itself makes it
     # into a slot. A dust-sized position can fail the minimum-notional check and
     # so produce no sellable ticket - but it must still never come back as a BUY
@@ -367,48 +489,80 @@ def propose(scores: pd.DataFrame, store: Store, run_id: str, cfg: Config = CONFI
     buying_power = None if cash_available is None else cash_available + exit_proceeds
 
     # ---- then entries, from the score ranking ---------------------------
-    ranked = scores.sort_values("composite", key=abs, ascending=False)
+    # "relative": best composite first, so the slate is the top of the
+    # cross-section on any given day. "absolute": biggest |composite| first,
+    # the old behaviour, which on a broad up day waves everything through.
+    ranked = (scores.sort_values("composite", ascending=False) if relative
+              else scores.sort_values("composite", key=abs, ascending=False))
+    n_buys = 0          # BUY slots are the budgeted resource; SELLs don't count
 
     for _, row in ranked.iterrows():
-        if len(candidates) - len(exiting) >= risk.max_proposals:
-            break
         composite = float(row["composite"])
         symbol = row["symbol"]
         if symbol in flagged_for_exit:
             skipped["flagged_for_exit"] += 1
             continue            # closing (or flagged to close) — never re-enter
-        if abs(composite) < risk.min_composite_score:
+
+        held = float(holdings.get(symbol, 0.0))
+        if composite > entry_floor:
+            side = "BUY"
+        elif composite < -trim_floor and held > 0:
+            side = "SELL"                # bearish holding, past the trim floor
+        elif composite < -entry_floor and held <= 0:
+            skipped["bearish_unheld"] += 1
+            continue        # bearish with no position: spot can't short — skip
+        else:
             skipped["below_score"] += 1
             continue
 
-        held = float(holdings.get(symbol, 0.0))
-        if composite > 0:
-            side = "BUY"
-        elif held > 0:
-            side = "SELL"
-        else:
-            skipped["bearish_unheld"] += 1
-            continue        # bearish with no position: spot can't short — skip
+        # BUY slots are the budgeted resource; risk-reducing SELLs are not and
+        # are never suppressed by a full BUY slate.
+        if side == "BUY" and n_buys >= risk.max_proposals:
+            continue
+        if side == "BUY" and block_buys:
+            skipped["regime_blocked"] += 1
+            continue
 
         entry = float(row["price"])
-        # Stop distance is scaled to DAILY volatility, matching a multi-day
-        # holding horizon. The floor keeps a freakishly quiet asset from
-        # producing a stop so tight that position size explodes.
-        atr_daily = float(row.get("atr_pct_daily") or row["atr_pct_1w"])
-        atr_abs = max(atr_daily * entry, entry * 0.01)
-        stop_dist = risk.atr_stop_mult * atr_abs
+        atr_daily = float(row.get("atr_pct_daily") or row["atr_pct_1w"] or 0.02)
+        # Stop distance vs the HOLDING HORIZON, not a single day. 1.5x daily ATR
+        # is ~3-5% for a major, which for a multi-week thesis sits inside the
+        # ordinary daily range and gets taken out by noise. sqrt-scaling by the
+        # expected trade duration widens it to something the thesis can survive;
+        # the min/max clamp keeps a placid or a wild asset from implying an
+        # absurd stop. Wider stop => smaller size for the same $ risk.
+        if risk.stop_scaling == "horizon":
+            horizon_mult = math.sqrt(max(1.0, risk.stop_horizon_days))
+            stop_pct = risk.atr_stop_mult * atr_daily * horizon_mult
+        else:
+            stop_pct = risk.atr_stop_mult * atr_daily
+        stop_pct = min(max(stop_pct, risk.stop_min_pct / 100.0), risk.stop_max_pct / 100.0)
+        stop_dist = stop_pct * entry
+
+        # Take-profit distance. With `fee_adjust_targets`, solve for the target
+        # that makes the NET reward:risk (after the full round-trip cost is
+        # subtracted from the reward AND added to the risk) come out to exactly
+        # `reward_risk_target` — not merely "widen by a fee", which left it
+        # short. Then cap the distance at `target_pct_cap` of entry so a
+        # clamped-wide stop can't imply a target no hold will ever reach.
+        rt_cost = rt_cost_frac * entry
+        if risk.fee_adjust_targets:
+            target_dist = risk.reward_risk_target * (stop_dist + rt_cost) + rt_cost
+        else:
+            target_dist = risk.reward_risk_target * stop_dist
+        target_dist = min(target_dist, risk.target_pct_cap / 100.0 * entry)
 
         if side == "BUY":
             stop = entry - stop_dist
-            target = entry + stop_dist * risk.reward_risk_target
+            target = entry + target_dist
         else:
             stop = entry + stop_dist
-            target = entry - stop_dist * risk.reward_risk_target
+            target = entry - target_dist
 
-        risk_budget = risk.account_equity_usd * (risk.risk_per_trade_pct / 100.0)
+        risk_budget = risk_equity * (risk.risk_per_trade_pct / 100.0)
         qty = risk_budget / stop_dist if stop_dist > 0 else 0.0
 
-        max_notional = risk.account_equity_usd * (risk.max_position_pct / 100.0)
+        max_notional = risk_equity * (risk.max_position_pct / 100.0)
         if side == "BUY" and buying_power is not None:
             # No single purchase may exceed what will actually be spendable
             # once this run's exits have settled.
@@ -429,8 +583,11 @@ def propose(scores: pd.DataFrame, store: Store, run_id: str, cfg: Config = CONFI
             "entry": entry, "stop": stop, "target": target,
             "qty": qty, "notional": notional,
             "risk_usd": min(risk_budget, notional),
+            "fee_est": notional * cfg.fees.effective_taker_bps / 10_000.0,
             "row": row, "exit_signal": None,
         })
+        if side == "BUY":
+            n_buys += 1
 
     if not candidates:
         return _empty(skipped)
@@ -439,12 +596,17 @@ def propose(scores: pd.DataFrame, store: Store, run_id: str, cfg: Config = CONFI
     # scaling exits down to respect a *deployment* limit is backwards.
     #
     # Three individually-affordable buys can still collectively overdraw the
-    # account, so the binding constraint is the sum, not the max.
+    # account, so the binding constraint is the sum, not the max. The deployment
+    # cap is additionally scaled by the market regime.
     buys = [c for c in candidates if c["side"] == "BUY"]
     buy_total = sum(c["notional"] for c in buys)
-    limits = [("deployment", risk.account_equity_usd * (risk.max_total_deployed_pct / 100.0))]
+    deploy_cap = risk_equity * (risk.max_total_deployed_pct / 100.0) * deploy_scale
+    limits = [("deployment", deploy_cap)]
     if buying_power is not None:
         limits.append(("cash", float(buying_power)))
+    if deploy_scale < 1.0 and buys:
+        print(f"  [regime] {regime_state}: deployment cap scaled ×{deploy_scale:.2f} "
+              f"→ ${deploy_cap:,.2f}")
 
     binding, cap = min(limits, key=lambda kv: kv[1])
     if buy_total > cap > 0:
@@ -464,6 +626,41 @@ def propose(scores: pd.DataFrame, store: Store, run_id: str, cfg: Config = CONFI
     if not candidates:
         return _empty(skipped)
 
+    # ---- correlation-aware heat cap (BUYs only) ------------------------
+    # sqrt(r' C r) over the new BUY slate vs `max_portfolio_heat_pct` of equity.
+    # This is what stops "three 1%-risk alt longs" from being one 2.5% bet.
+    buys = [c for c in candidates if c["side"] == "BUY"]
+    if risk.correlation_sizing and len(buys) >= 2:
+        try:
+            from . import portfolio_risk as prisk
+            risk_by_sym = {c["symbol"]: c["risk_usd"] for c in buys}
+            corr = prisk.correlation_matrix(list(risk_by_sym), cfg,
+                                            risk.corr_lookback_days)
+            heat = prisk.portfolio_heat(risk_by_sym, corr)
+            heat_cap = risk_equity * (risk.max_portfolio_heat_pct / 100.0)
+            if heat["heat_usd"] > heat_cap > 0:
+                hscale = heat_cap / heat["heat_usd"]
+                for c in buys:
+                    c["qty"] *= hscale
+                    c["notional"] *= hscale
+                    c["risk_usd"] *= hscale
+                    c["fee_est"] *= hscale
+                candidates = [c for c in candidates
+                              if c["side"] == "SELL" or c["notional"] >= risk.min_notional_usd]
+                print(f"  [heat cap] slate risk ${heat['heat_usd']:,.2f} "
+                      f"(gross ${heat['gross_usd']:,.2f}, div-ratio "
+                      f"{heat['diversification_ratio']:.2f}) → ${heat_cap:,.2f} "
+                      f"(×{hscale:.3f}); {len([c for c in candidates if c['side']=='BUY'])} "
+                      f"BUY(s) remain.")
+            else:
+                print(f"  [heat] slate risk ${heat['heat_usd']:,.2f} vs cap "
+                      f"${heat_cap:,.2f} (div-ratio {heat['diversification_ratio']:.2f}) — ok")
+        except Exception as exc:  # noqa: BLE001 - heat cap is best-effort
+            print(f"  [heat] skipped ({exc})")
+
+    if not candidates:
+        return _empty(skipped)
+
     from . import exits as exits_mod
 
     ts = iso()
@@ -472,14 +669,34 @@ def propose(scores: pd.DataFrame, store: Store, run_id: str, cfg: Config = CONFI
         row = c["row"]
         sig = c.get("exit_signal")
         is_exit = sig is not None
-        rr = abs(c["target"] - c["entry"]) / max(abs(c["entry"] - c["stop"]), 1e-9)
+        gross_reward = abs(c["target"] - c["entry"])
+        risk_amt = max(abs(c["entry"] - c["stop"]), 1e-9)
+        rr = gross_reward / risk_amt
+        # Net R:R once the full round-trip cost (fees + slippage, both legs) is
+        # taken off the reward and added to the risk — the number that actually
+        # matters. Uses the same cost figure the target was sized against, so
+        # with fee_adjust_targets on this lands on reward_risk_target exactly
+        # (unless target_pct_cap or the deployment scaler bit).
+        rt_cost = rt_cost_frac * c["entry"]
+        rr_net = max(0.0, gross_reward - rt_cost) / (risk_amt + rt_cost)
+        fee_est = float(c.get("fee_est", c["notional"] * cfg.fees.effective_taker_bps / 10_000.0))
 
         if row is not None:
             payload = {
                 "components": row["components"],
-                "scores": {"technical": row["technical"], "social": row["social"],
-                           "catalyst": row["catalyst"], "composite": row["composite"]},
+                "scores": {"technical": row["technical"],
+                           "technical_raw": row.get("technical_raw"),
+                           "xsec": row.get("xsec"), "social": row["social"],
+                           "catalyst": row["catalyst"],
+                           "positioning": row.get("positioning"),
+                           "events": row.get("events"),
+                           "composite": row["composite"]},
                 "weights": cfg.weights.normalized().__dict__,
+                "sizing": {"risk_equity": round(risk_equity, 2),
+                           "regime": regime_state,
+                           "fee_est_roundtrip": round(fee_est * 2, 2),
+                           "reward_risk_gross": round(rr, 2),
+                           "reward_risk_net": round(rr_net, 2)},
             }
         else:
             # Held asset with no score row (e.g. price fetch failed). The exit
@@ -497,7 +714,9 @@ def propose(scores: pd.DataFrame, store: Store, run_id: str, cfg: Config = CONFI
             "target": round(c["target"], 8),
             "qty": float(c["qty"]), "notional": round(c["notional"], 2),
             "risk_usd": round(c["risk_usd"], 2),
+            "fee_est": round(fee_est, 2),
             "reward_risk": 0.0 if is_exit else round(rr, 2),
+            "reward_risk_net": 0.0 if is_exit else round(rr_net, 2),
             "kind": "exit" if is_exit else "entry",
             "trigger": sig["trigger_label"] if is_exit else "",
             "horizon": "close now" if is_exit else _horizon_label(cfg),
@@ -509,7 +728,8 @@ def propose(scores: pd.DataFrame, store: Store, run_id: str, cfg: Config = CONFI
 
     df = pd.DataFrame(out)
     store.save_proposals(
-        df.drop(columns=["risk_usd", "reward_risk", "kind", "trigger"]).to_dict("records"))
+        df.drop(columns=["risk_usd", "reward_risk", "reward_risk_net", "fee_est",
+                         "kind", "trigger"]).to_dict("records"))
     return df
 
 
@@ -577,11 +797,14 @@ def format_proposals(proposals: pd.DataFrame) -> str:
                     f"CONFIG.risk.min_notional_usd if your venue allows smaller orders."
                 )
         if sk.get("below_score"):
-            lines.append(f"  · {sk['below_score']} scored under "
-                         f"min_composite_score ({min_score:+.2f}).")
+            lines.append(f"  · {sk['below_score']} scored under the entry floor "
+                         f"({min_score:+.2f}).")
         if sk.get("bearish_unheld"):
             lines.append(f"  · {sk['bearish_unheld']} were bearish on assets you "
                          f"don't hold — spot can't short, so that's an avoid.")
+        if sk.get("regime_blocked"):
+            lines.append(f"  · {sk['regime_blocked']} BUY(s) blocked — market regime is "
+                         f"risk_off ({proposals.attrs.get('regime', '?')}). Exits still run.")
         if sk.get("flagged_for_exit"):
             lines.append(f"  · {sk['flagged_for_exit']} are already flagged for exit.")
         if sk.get("no_scores"):
@@ -608,13 +831,15 @@ def format_proposals(proposals: pd.DataFrame) -> str:
         else:
             move_pct = (p["target"] - p["entry"]) / p["entry"] * 100
             stop_pct = (p["stop"] - p["entry"]) / p["entry"] * 100
+            rr_net = p.get("reward_risk_net", p["reward_risk"])
+            fee = p.get("fee_est", 0.0)
             lines.append(
                 f"  entry   {fmt_price(p['entry']):>16}\n"
                 f"  stop    {fmt_price(p['stop']):>16}   ({stop_pct:+.2f}%)\n"
                 f"  target  {fmt_price(p['target']):>16}   ({move_pct:+.2f}%)   "
-                f"R:R {p['reward_risk']:.2f}\n"
+                f"R:R {p['reward_risk']:.2f} gross / {rr_net:.2f} net of fees\n"
                 f"  size    {fmt_qty(p['qty']):>16} {p['symbol']}  ≈ ${p['notional']:,.2f}   "
-                f"risk ≈ ${p['risk_usd']:,.2f}\n"
+                f"risk ≈ ${p['risk_usd']:,.2f}   fee ≈ ${fee:,.2f}/side\n"
             )
         lines.append(f"\n  {p['rationale']}\n")
     return "".join(lines)
