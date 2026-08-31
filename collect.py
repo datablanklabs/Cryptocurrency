@@ -27,6 +27,7 @@ PROJECT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT))
 
 from cryptoyolo.config import CONFIG, load_dotenv  # noqa: E402
+from cryptoyolo.logsetup import configure, get_logger  # noqa: E402
 from cryptoyolo.store import Store  # noqa: E402
 
 LOCK_PATH = PROJECT / "data" / "collector.lock"
@@ -75,11 +76,16 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="crypto-yolo collector")
     ap.add_argument("--catalysts", action="store_true",
                     help="also scan news RSS and GitHub releases")
+    ap.add_argument("--prices", action="store_true",
+                    help="also sweep 1y daily closes into prices_daily "
+                         "(keeps evaluation's price record fresh between cycles)")
     ap.add_argument("--status", action="store_true",
                     help="report what has been collected, then exit")
     args = ap.parse_args()
 
     load_dotenv()
+    configure()
+    log = get_logger("collect")
     store = Store(CONFIG.db_path)
 
     if args.status:
@@ -95,11 +101,14 @@ def main() -> int:
             return 0
 
         print(f"[{stamp()}] collecting...")
+        log.info("collection pass started (catalysts=%s prices=%s)",
+                 args.catalysts, args.prices)
         from cryptoyolo import social
         try:
             stats = social.scrape(store, CONFIG, verbose=True)
             print(f"  reddit: {stats}")
         except Exception as exc:  # noqa: BLE001 - never let one source kill the job
+            log.exception("reddit collection failed")
             print(f"  ! reddit failed: {exc}")
 
         from cryptoyolo import feeds
@@ -107,12 +116,14 @@ def main() -> int:
             fstats = feeds.scrape(store, CONFIG, verbose=True)
             print(f"  feeds: {fstats}")
         except Exception as exc:  # noqa: BLE001
+            log.exception("feeds collection failed")
             print(f"  ! feeds failed: {exc}")
 
         from cryptoyolo import positioning
         try:
             positioning.fetch(store, CONFIG, verbose=True)
         except Exception as exc:  # noqa: BLE001
+            log.exception("funding fetch failed")
             print(f"  ! funding fetch failed: {exc}")
 
         if args.catalysts:
@@ -121,9 +132,24 @@ def main() -> int:
                 n = catalysts.scan(store, CONFIG, verbose=True)
                 print(f"  catalysts: {n} events")
             except Exception as exc:  # noqa: BLE001
+                log.exception("catalyst scan failed")
                 print(f"  ! catalysts failed: {exc}")
 
-        print(f"[{stamp()}] done — history span now {store.history_span_hours():.1f}h")
+        if args.prices:
+            from cryptoyolo import prices as prices_mod
+            ok = 0
+            for sym in CONFIG.symbols:
+                try:
+                    df, src = prices_mod.get_ohlcv(sym, "1y", CONFIG)
+                    store.upsert_daily_prices_from_series(sym, df["close"], src)
+                    ok += 1
+                except Exception as exc:  # noqa: BLE001 - one bad symbol is fine
+                    log.warning("price sweep %s failed: %s", sym, exc)
+            print(f"  prices: {ok}/{len(CONFIG.symbols)} symbols → prices_daily")
+
+        span = store.history_span_hours()
+        log.info("collection pass done — history span %.1fh", span)
+        print(f"[{stamp()}] done — history span now {span:.1f}h")
     return 0
 
 

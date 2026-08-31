@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.crypto-yolo.trader</string>
+
+    <!-- One unattended paper cycle a day. This is what feeds the evaluation
+         module: without it, scores / proposals / equity snapshots / regime
+         verdicts only accrue when someone opens the notebook, and the
+         equity-curve, benchmark and regime-effectiveness analyses never have
+         enough data to run.
+
+         --paper is a hard floor: this job can NEVER place a live order, even if
+         CONFIG is switched to binance for manual runs.
+         --auto-approve records decisions as `auto-approved` so the audit trail
+         keeps machine picks separate from yours. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/Frameworks/Python.framework/Versions/3.13/bin/python3</string>
+        <string>/Users/socrates/Documents/notebooks/crypto-yolo/run_cycle.py</string>
+        <string>--auto-approve</string>
+        <string>--paper</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/socrates/Documents/notebooks/crypto-yolo</string>
+
+    <!-- 13:05 local. After the 08:00 collector pass has landed fresh
+         social / funding / catalyst data, and well clear of it so the two jobs
+         don't write the SQLite file at the same instant. Daily is plenty — the
+         signal horizons are 1d / 7d / 30d. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key><integer>13</integer>
+        <key>Minute</key><integer>5</integer>
+    </dict>
+
+    <!-- Unlike the collector, do NOT fire a cycle just because the job loaded:
+         an immediate unattended trade is more surprising than an immediate
+         data pull. Run `./run_cycle.py --auto-approve --paper` by hand once to
+         confirm it works. -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/socrates/Documents/notebooks/crypto-yolo/data/trader.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/socrates/Documents/notebooks/crypto-yolo/data/trader.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
+</dict>
+</plist>

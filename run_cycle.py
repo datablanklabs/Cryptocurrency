@@ -28,6 +28,7 @@ PROJECT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT))
 
 from cryptoyolo.config import CONFIG, load_dotenv  # noqa: E402
+from cryptoyolo.logsetup import configure, get_logger  # noqa: E402
 from cryptoyolo.store import Store  # noqa: E402
 
 LOCK_PATH = PROJECT / "data" / "run_cycle.lock"
@@ -50,6 +51,8 @@ def main() -> int:
         return 2
 
     load_dotenv()
+    configure()
+    log = get_logger("run_cycle")
     if args.paper:
         CONFIG.execution.mode = "paper"
 
@@ -75,6 +78,8 @@ def main() -> int:
         started = datetime.now(timezone.utc)
         print(f"[{started:%Y-%m-%d %H:%M:%S UTC}] starting cycle "
               f"(approve={args.approve}, auto_approve={args.auto_approve})")
+        log.info("cycle start (mode=%s approve=%s auto_approve=%s collect=%s)",
+                 CONFIG.execution.mode, args.approve, args.auto_approve, args.collect)
 
         result = pipeline.run(
             store, CONFIG,
@@ -92,6 +97,8 @@ def main() -> int:
         done = datetime.now(timezone.utc)
         print(f"[{done:%Y-%m-%d %H:%M:%S UTC}] cycle complete in "
               f"{(done - started).total_seconds():.1f}s — {n} order(s) executed")
+        log.info("cycle finished in %.1fs — %d order(s); summary=%s",
+                 (done - started).total_seconds(), n, result.get("summary"))
     return 0
 
 

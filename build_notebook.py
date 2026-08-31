@@ -29,7 +29,11 @@ CELLS = [
 md(r"""
 # crypto-yolo — trading dashboard
 
-Run all cells. The notebook refreshes four feature families, scores the
+> **This notebook is generated from `build_notebook.py` and ships without saved
+> outputs.** If it looks empty, that's expected — **Run → Run All Cells**. Edits
+> belong in `build_notebook.py`; re-run it to regenerate this file.
+
+Run all cells. The notebook refreshes five feature families, scores the
 universe, proposes up to **3 ranked trade candidates**, asks you to approve each
 one (auto-approval is opt-in, never the default), and executes the approved ones
 through the Binance API.
@@ -40,10 +44,17 @@ a backstop, since stop, target, trailing and score-reversal usually fire first.
 
 | Feature | Source | Feeds |
 |---|---|---|
-| **1 · Price & bands** | Binance.US → Coinbase → Kraken → yfinance | technical score |
+| **1 · Price & bands** | Binance.US → Coinbase → Kraken → yfinance | technical score (+ cross-sectional momentum) |
 | **2 · Social sentiment** | 13 subreddits + StockTwits + Mastodon + /biz/ | social score |
 | **3 · Dev & news catalysts** | GitHub releases, CoinDesk/Cointelegraph/Decrypt/Defiant | catalyst score |
 | **4 · Positioning** | OKX perpetual funding rates | positioning score |
+| **5 · Scheduled events** | hand-maintained calendar (unlocks, mainnets, ETF dates) | events score |
+
+Sizing is against **live equity**, the stop is scaled to the holding horizon,
+targets are widened to clear round-trip fees, and a **BTC-trend regime gate**
+scales the whole slate (blocking new buys in a downtrend). The
+**Evaluation & benchmark** section near the end is the feedback loop: it scores
+the engine against realised returns and against buy-and-hold BTC.
 
 ---
 
@@ -54,15 +65,16 @@ trades that *will* maximise profit over the next week. What this does is score
 every asset with a transparent, hand-tuned formula, show you every component
 that went into each score, and size positions against a stated risk budget. The
 weights in `ScoreWeights` are priors chosen by hand — **they have not been
-fitted to realised returns and this has not been backtested.** Treat the output
-as a research shortlist that shows its work, not as a forecast.
+fitted to realised returns.** The Evaluation section measures whether they hold
+up; until it says so, treat the output as a research shortlist that shows its
+work, not as a forecast.
 
 **Signal quality, honestly.** Reddit mention volume is trivially gamed and
 mostly lagging — by the time a coin trends on r/wsb, the move usually already
-happened. That is why social carries a low weight. The most genuinely
-forward-looking input here is the *scheduled* catalyst: a token unlock dated
-next Tuesday is knowable in advance in a way that a price move is not. The
-newest family, **positioning**, is the only one that goes reliably negative —
+happened. That is why social carries a low weight. The genuinely forward-looking
+family is **events**: a token unlock dated next Tuesday is knowable now in a way
+a price move is not (it ships empty — you maintain the schedule).
+**Positioning** is the only family that goes reliably negative on its own —
 without it the composite drifts toward rating everything a buy.
 
 **Execution is gated.** Default mode is `paper` — simulated fills, nothing
@@ -101,7 +113,9 @@ pd.set_option("display.width", 200)
 pd.set_option("display.max_columns", 50)
 pio.renderers.default = "notebook"
 
-from cryptoyolo import charts, engine, indicators, pipeline, prices, scheduler
+from cryptoyolo import (charts, engine, evaluation, indicators, pipeline, prices,
+                        regime, scheduler)
+from cryptoyolo import calendar_events as events_mod
 from cryptoyolo import catalysts as catalysts_mod
 from cryptoyolo import feeds as feeds_mod
 from cryptoyolo import social as social_mod
@@ -114,7 +128,8 @@ store = Store(CONFIG.db_path)
 # Fail loudly and legibly if the loaded code is still older than this notebook,
 # rather than letting a later cell die on a missing attribute.
 _required = {"exits": "exit management", "risk": "risk sizing",
-             "execution": "order execution"}
+             "execution": "order execution", "fees": "fee model",
+             "regime": "regime gate", "events": "scheduled events"}
 _missing = [f"CONFIG.{a} ({why})" for a, why in _required.items()
             if not hasattr(CONFIG, a)]
 if _missing:
@@ -151,18 +166,75 @@ md("## Configuration"),
 
 code(r"""
 # ── Risk ────────────────────────────────────────────────────────────────
-# account_equity_usd is the RISK BASIS only — it sets how much you're willing
-# to lose per trade. It is NOT a spending limit. Actual purchases are separately
-# capped at your real spendable balance (paper cash, or free USDT on Binance),
-# so this number being larger than your balance can't cause an overdraft.
-CONFIG.risk.account_equity_usd   = 10_000.0
-CONFIG.risk.risk_per_trade_pct   = 1.0        # % of equity lost if stopped out
-CONFIG.risk.max_position_pct     = 20.0       # cap per position
-CONFIG.risk.max_total_deployed_pct = 60.0     # cap across all proposals
-CONFIG.risk.atr_stop_mult        = 1.5        # stop = 1.5 x daily ATR(14)
-CONFIG.risk.reward_risk_target   = 2.0        # target = 2R
-CONFIG.risk.max_proposals        = 3
-CONFIG.risk.min_composite_score  = 0.10       # 0.0 = always fill all 3 slots
+# account_equity_usd is the FALLBACK risk basis — used only when live equity
+# can't be read. With size_off_live_equity=True (default) the risk budget is
+# recomputed each cycle from cash + marked-to-market positions, so the book
+# compounds after a good run and de-risks in a drawdown on its own.
+CONFIG.risk.account_equity_usd    = 10_000.0
+CONFIG.risk.size_off_live_equity  = True
+CONFIG.risk.risk_per_trade_pct    = 1.0        # % of equity lost if stopped out
+CONFIG.risk.max_position_pct      = 20.0       # cap per position
+CONFIG.risk.max_total_deployed_pct = 60.0     # cap across all proposals (× regime scale)
+CONFIG.risk.reward_risk_target    = 2.0        # target = 2R (net of fees if fee_adjust_targets)
+CONFIG.risk.fee_adjust_targets    = True       # widen the target so NET R:R = 2
+CONFIG.risk.max_proposals         = 3
+
+# Stop distance vs the HOLDING horizon. "horizon" scales 1.5×daily-ATR by
+# sqrt(stop_horizon_days) so a multi-week thesis isn't stopped by one day's
+# noise; "legacy" is the old 1.5×daily-ATR stop. Wider stop ⇒ smaller size for
+# the same 1% $ risk. Tune stop_horizon_days / atr_stop_mult from the eval loop.
+CONFIG.risk.stop_scaling          = "horizon"  # "horizon" | "legacy"
+CONFIG.risk.stop_horizon_days     = 10.0
+CONFIG.risk.atr_stop_mult         = 1.5
+CONFIG.risk.stop_min_pct          = 3.0        # clamp: floor on stop distance
+CONFIG.risk.stop_max_pct          = 40.0       # clamp: cap on stop distance
+CONFIG.risk.target_pct_cap        = 60.0       # a clamped-wide stop can't imply an unreachable target
+
+# Candidate selection. "relative" takes the top max_proposals of the
+# cross-section each run (so a broad down day still surfaces the best relative
+# longs, a broad up day doesn't wave everything through); "absolute" keeps the
+# old fixed |composite| ≥ min_composite_score gate.
+CONFIG.risk.selection_mode        = "relative"   # "relative" | "absolute"
+CONFIG.risk.min_composite_floor   = 0.03         # relative mode: never trade pure noise
+CONFIG.risk.min_composite_score   = 0.10         # absolute mode only
+CONFIG.risk.trim_threshold        = 0.10         # trim a holding only once this bearish (both modes)
+
+# Correlation-aware sizing. Caps sqrt(r' C r) over the new BUY slate — three
+# 1%-risk alt longs that move together are really one ~2.5% bet. Scales the
+# whole slate down if the correlation-adjusted risk exceeds this % of equity.
+CONFIG.risk.correlation_sizing    = True
+CONFIG.risk.max_portfolio_heat_pct = 2.5
+CONFIG.risk.corr_lookback_days    = 60
+
+# ── Fees & slippage (the return you give away on every trade) ───────────
+# Binance.US base tier is ~40 bps taker/maker — a ~0.8% round trip. Enable the
+# BNB discount for a 25% cut, earn a lower tier with volume, and prefer the
+# marketable-limit entry below over MARKET. slippage_bps is applied to PAPER
+# fills so the paper record isn't optimistic vs live.
+CONFIG.fees.enabled           = True
+CONFIG.fees.taker_bps         = 40.0
+CONFIG.fees.maker_bps         = 40.0
+CONFIG.fees.use_bnb_discount  = False       # set True if you hold BNB for fees
+CONFIG.fees.slippage_bps      = 6.0
+
+# ── Market-regime gate (BTC trend) ─────────────────────────────────────
+# Scales the whole slate's deployment by where BTC sits vs its long MA, and
+# blocks new BUYs outright in a hard downtrend. Exits are never gated.
+CONFIG.regime.enabled                        = True
+CONFIG.regime.ma_days                        = 200
+CONFIG.regime.ma_band_pct                    = 2.0   # dead-band so an MA chop doesn't flip the gate
+CONFIG.regime.neutral_exposure               = 0.5
+CONFIG.regime.risk_off_exposure              = 0.0
+CONFIG.regime.block_new_entries_when_risk_off = True
+
+# ── Scheduled events (Feature 5 — the one forward-looking family) ───────
+# Token unlocks, mainnet dates, ETF decisions, listing effective dates. The
+# schedule is hand-maintained in cryptoyolo/config.py::SCHEDULED_EVENTS — it
+# ships EMPTY, so this family scores 0 until you populate it. Weight is set
+# below alongside the others.
+CONFIG.events.enabled          = True
+CONFIG.events.lookahead_days   = 30.0
+CONFIG.events.peak_window_days = 7.0
 
 # ── Exits: when to close an existing position ───────────────────────────
 # Five independent triggers, each switchable. Evaluated every run against live
@@ -182,13 +254,18 @@ CONFIG.exits.score_reversal_threshold = -0.15
 CONFIG.exits.max_exit_proposals       = 3       # exits get their OWN slots
 
 # ── Score weights (must be defensible to you, not to me) ────────────────
-# normalized() divides by the sum, so adding positioning=0.10 alongside the
-# original 0.50/0.20/0.30 preserves their ratios exactly and just makes room.
-# Set positioning = 0.0 to restore the previous three-family composite.
+# Hand-set priors. Once the DB holds a few weeks of runs, the Evaluation
+# section near the end prints a data-driven ScoreWeights from measured ICs —
+# use that instead of trusting these. normalized() divides by the sum, so any
+# weight can go to 0.0 to drop that family.
 CONFIG.weights.technical   = 0.50
 CONFIG.weights.social      = 0.20
 CONFIG.weights.catalyst    = 0.30
 CONFIG.weights.positioning = 0.10
+CONFIG.weights.events      = 0.0    # scheduled dated catalysts — raise to ~0.15 once SCHEDULED_EVENTS is filled
+# Cross-sectional momentum blended into the technical score (not a family):
+# technical_final = 0.7·technical + 0.3·xsec_rank. 0.0 restores the isolated score.
+CONFIG.weights.xsec_momentum_blend = 0.30
 
 # ── Positioning: perpetual funding as a crowding measure ────────────────
 # Contrarian by default — crowded positioning is fragile positioning, so
@@ -215,8 +292,19 @@ CONFIG.bands.show_rsi         = True
 CONFIG.execution.mode        = "paper"
 CONFIG.execution.venue       = "binance-us"   # binance-com / binance-test are geo-blocked from US IPs
 CONFIG.execution.dry_run     = True
-CONFIG.execution.order_type  = "MARKET"
+CONFIG.execution.order_type  = "MARKET"       # EXITS must fill, so they stay MARKET
 CONFIG.execution.quote_asset = "USDT"
+# Entries go as a marketable IOC LIMIT: crosses the book by at most
+# entry_limit_cross_bps (fills now, usually as taker), and the unfilled part is
+# cancelled rather than left resting — a resting entry would desync the position
+# book. A partial fill is kept and the position is sized to it. Set
+# entry_order_type="MARKET" for the old unbounded-slippage behaviour.
+CONFIG.execution.entry_order_type      = "LIMIT"
+CONFIG.execution.entry_limit_cross_bps = 15.0
+# Refuse an entry if the live price has gapped this far above the proposal
+# price. Read via CONFIG.execution.entry_slippage_guard_bps, which keeps it a
+# margin above entry_limit_cross_bps so the two can't drift out of sync.
+CONFIG.execution.max_entry_slippage_bps = 60.0
 
 # ── Protective resting orders (continuous, venue-side protection) ────────
 # The exits pass only sees the market when you run the notebook. An order
@@ -233,11 +321,22 @@ CONFIG.execution.use_trailing_delta      = False   # let Binance trail the stop 
 CONFIG.execution.trailing_delta_bps      = 0       # 0 = derive from CONFIG.exits.trail_pct
 
 w = CONFIG.weights.normalized()
-print(f"weights    : technical {w.technical:.0%} · social {w.social:.0%} · catalyst {w.catalyst:.0%}")
-print(f"risk/trade : ${CONFIG.risk.account_equity_usd * CONFIG.risk.risk_per_trade_pct / 100:,.2f}")
+print(f"weights    : technical {w.technical:.0%} · social {w.social:.0%} · catalyst {w.catalyst:.0%} "
+      f"· positioning {w.positioning:.0%} · events {w.events:.0%}")
+print(f"risk/trade : {CONFIG.risk.risk_per_trade_pct:.1f}% of "
+      f"{'live equity' if CONFIG.risk.size_off_live_equity else f'${CONFIG.risk.account_equity_usd:,.0f}'}")
+print(f"stop       : {CONFIG.risk.stop_scaling} "
+      f"(≈{CONFIG.risk.atr_stop_mult}×dailyATR×√{CONFIG.risk.stop_horizon_days:.0f}d, "
+      f"clamp {CONFIG.risk.stop_min_pct:.0f}–{CONFIG.risk.stop_max_pct:.0f}%)")
+print(f"selection  : {CONFIG.risk.selection_mode}   ·   fees {CONFIG.fees.effective_taker_bps:.0f} bps taker "
+      f"(round trip {CONFIG.fees.round_trip_bps:.0f} bps)")
+print(f"heat cap   : {'on' if CONFIG.risk.correlation_sizing else 'OFF'}, "
+      f"{CONFIG.risk.max_portfolio_heat_pct:.1f}% of equity (corr over {CONFIG.risk.corr_lookback_days}d)")
 
 from cryptoyolo.broker import execution_banner
+from cryptoyolo import regime as _regime
 print(f"execution  : {execution_banner(CONFIG)}")
+print(f"regime     : {_regime.describe(_regime.assess(CONFIG))}")
 """),
 
 md(r"""
@@ -606,26 +705,30 @@ md(r"""
 ---
 ## Decision engine
 
-Composite = `0.45 × technical + 0.18 × social + 0.27 × catalyst + 0.09 ×
-positioning` (the normalised form of 0.50/0.20/0.30/0.10), each component in
-[-1, +1].
+Composite = `w_technical × technical + w_social × social + w_catalyst × catalyst
++ w_positioning × positioning + w_events × events` — the normalised form of the
+weights set in Configuration, each component in [-1, +1]. `technical` is itself
+`0.7 × (per-asset technical) + 0.3 × (cross-sectional momentum rank)`, so a
+column `technical_raw` shows the isolated score and `xsec` the universe-relative
+part.
 
-The one genuinely non-obvious piece is how band position is read: in a trending
-market, price riding the upper Bollinger band is *strength*; in a range-bound
-market the identical reading is *stretched*. A single fixed interpretation is
-wrong half the time, so trend strength decides which reading applies.
+The one genuinely non-obvious piece of the per-asset technical score is how band
+position is read: in a trending market, price riding the upper Bollinger band is
+*strength*; in a range-bound market the identical reading is *stretched*. A
+single fixed interpretation is wrong half the time, so trend strength decides.
 """),
 
 code(r"""
 scores = engine.build_scores(store, CONFIG, verbose=True)
 
 display(scores[[
-    "symbol", "composite", "technical", "social", "catalyst",
-    "price", "rsi_1w", "bb_pctb_1w", "atr_pct_daily",
+    "symbol", "composite", "technical", "technical_raw", "xsec", "social",
+    "catalyst", "positioning", "events", "price", "rsi_1w", "atr_pct_daily",
     "mentions_24h", "n_events", "top_event",
 ]].style.format({
-    "composite": "{:+.3f}", "technical": "{:+.3f}", "social": "{:+.3f}",
-    "catalyst": "{:+.3f}", "price": "{:,.4f}", "bb_pctb_1w": "{:.2f}",
+    "composite": "{:+.3f}", "technical": "{:+.3f}", "technical_raw": "{:+.3f}",
+    "xsec": "{:+.2f}", "social": "{:+.3f}", "catalyst": "{:+.3f}",
+    "positioning": "{:+.3f}", "events": "{:+.3f}", "price": "{:,.4f}",
     "atr_pct_daily": "{:.2%}",
 }).background_gradient(subset=["composite"], cmap="RdYlGn", vmin=-0.6, vmax=0.6)
   .hide(axis="index"))
@@ -698,8 +801,68 @@ if _props.empty:
     print("No proposals to review this run — see the diagnosis above.")
 else:
     _cols = ["rank", "symbol", "side", "kind", "trigger", "composite", "entry",
-             "stop", "target", "qty", "notional", "reward_risk", "decision"]
+             "stop", "target", "qty", "notional", "fee_est", "reward_risk",
+             "reward_risk_net", "decision"]
     display(_props[[c for c in _cols if c in _props.columns]])
+"""),
+
+md(r"""
+## Did it work? — Evaluation & benchmark
+
+The weights above are hand-set priors. This section is the feedback loop that
+tells you whether they mean anything: it joins every stored score to the asset's
+**realised** forward return, measures each family's information coefficient
+(rank-correlation with return), reconstructs the actual round-trip trades net of
+fees, and compares the equity curve to simply holding BTC.
+
+With only a couple of weeks of data every number here is noisy — a t-stat under
+~2 is "no evidence", not a finding. Re-run this weekly; act on it after a month.
+"""),
+
+code(r"""
+from cryptoyolo import evaluation as ev
+
+report = ev.summary(store, CONFIG, horizons=(1, 7, 30), primary_horizon=7)
+"""),
+
+code(r"""
+# The full information-coefficient table (per-run mean IC, its t-stat, and the
+# pooled IC) for every family at every horizon. Negative mean_IC = the family
+# is pointing the wrong way over that horizon.
+display(report["ic"])
+"""),
+
+code(r"""
+# Realised trades, newest first — every round trip the order log implies, with
+# P&L net of fees and the fee drag as a share of gross P&L.
+_tr = report["trades"]
+if _tr.empty:
+    print("No closed trades yet.")
+else:
+    display(_tr.tail(20))
+    display(report["trade_stats"])
+"""),
+
+code(r"""
+# Data-driven weights from the measured ICs. This does NOT change anything —
+# it prints a ScoreWeights(...) you can paste into the Configuration cell once
+# there is enough history for the t-stats to clear |t| ≥ 2. The blend_verdict
+# is the headline: does the composite even beat its own best component?
+_rec = report["recommendation"]
+if _rec.get("blend_verdict"):
+    print(_rec["blend_verdict"], "\n")
+print(_rec.get("code") or _rec.get("note"))
+"""),
+
+code(r"""
+# Regime-gate self-check: realised forward return per regime state. The gate is
+# working if risk_off rows precede weaker universe / top-N returns than risk_on.
+# Empty until a few cycles have run with the gate on (pipeline.run logs it).
+_re = report["regime_effectiveness"]
+if _re is None or _re.empty:
+    print("No regime history yet — runs before this build didn't log it.")
+else:
+    display(_re)
 """),
 
 md("## Portfolio & audit trail"),
@@ -793,17 +956,13 @@ dies with the kernel — use launchd for the baseline.
 
 ### Worth doing before trusting the scores
 
-The weights are priors, not findings. Every run writes its scores and
-proposals to SQLite, so after a few weeks you can check the only question that
-matters — whether high composite scores actually preceded higher returns:
-
-```python
-import pandas as pd
-with store.conn() as con:
-    hist = pd.read_sql_query("SELECT ts, symbol, composite FROM scores", con)
-# join each row to the asset's forward 1d / 7d return and correlate.
-# If the correlation is ~0, the weights are decoration. Change them.
-```
+The weights are priors, not findings. The **Evaluation & benchmark** section
+above is the check: it joins every stored score to the realised forward return
+and reports each family's information coefficient, the top-vs-bottom spread, the
+realised trade record net of fees, and the equity curve against BTC
+buy-and-hold. Run it weekly (`evaluation.summary(store, CONFIG)`); once the
+t-stats clear |t| ≥ 2, replace the hand-set weights with
+`evaluation.recommend_weights(...)`'s output.
 """),
 ]
 

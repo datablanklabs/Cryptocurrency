@@ -1,13 +1,14 @@
 # crypto-yolo
 
-A Jupyter dashboard that pulls crypto price data, Reddit sentiment, and
-developer/news catalysts; scores the universe with a transparent formula;
-proposes up to three ranked trade candidates on short-horizon signals (held up
-to `exits.horizon_days`, default 30);
-asks for per-trade approval (or `--auto-approve`, opt-in); and executes approved
-trades through the Binance API.
+A Jupyter dashboard that pulls crypto price data, Reddit sentiment,
+developer/news catalysts and a scheduled-events calendar; scores the universe
+with a transparent formula; proposes up to three ranked trade candidates on
+short-horizon signals (held up to `exits.horizon_days`, default 30); asks for
+per-trade approval (or `--auto-approve`, opt-in); and executes approved trades
+through the Binance API.
 
 ```bash
+python3 build_notebook.py            # the notebook is generated & gitignored
 jupyter lab crypto_yolo_dashboard.ipynb
 ```
 
@@ -18,17 +19,73 @@ only to place orders.
 
 ---
 
+## The return-focused pass (what changed, and why)
+
+The engine was rebuilt around one gap: **there was no feedback loop.** Scores
+were written to SQLite for years' worth of "did high scores precede higher
+returns?" and nobody had ever answered it. Working in the order that matters:
+
+1. **`evaluation.py` — the feedback loop.** Joins every stored score to the
+   asset's realised 1d/7d/30d forward return; reports each family's information
+   coefficient with a t-stat; reconstructs the real round-trip trades net of
+   fees; compares the equity curve to buy-and-hold BTC; and prints a
+   data-driven `ScoreWeights` to replace the hand-set priors. Paper fills now
+   model **fees + slippage** so the paper record isn't optimistic vs live.
+2. **Execution cost.** A `FeeConfig` (Binance.US ~40 bps taker, BNB-discount
+   aware); entries go as a **marketable IOC limit** — crosses the book by at
+   most `entry_limit_cross_bps`, fills now, and the unfilled remainder is
+   cancelled rather than left resting (a partial fill is kept and the position
+   sized to it); targets are widened so the *net* reward:risk after the full
+   round trip (fees **and** slippage) equals `reward_risk_target`, then capped
+   at `target_pct_cap` so a clamped-wide stop can't imply an unreachable
+   target.
+3. **Sizing & risk.** Position size is off **live equity** (cash + MTM
+   positions), so the book compounds and de-risks on its own. The stop is
+   **scaled to the holding horizon** (`1.5·dailyATR·√stop_horizon_days`) instead
+   of 1.5·dailyATR, which for a multi-week hold sat inside one day's noise. A
+   **BTC-trend regime gate** (with a `ma_band_pct` dead-band so an MA chop
+   doesn't flip it) scales the whole slate and blocks new buys in a downtrend.
+4. **Signal.** A fifth family, **`events`** (scheduled unlocks / mainnets / ETF
+   dates — genuinely forward-looking; weight defaults to **0** until you fill
+   `SCHEDULED_EVENTS`); **cross-sectional momentum** blended into the technical
+   score; **relative selection** (take the top of the cross-section, not
+   everything over a fixed threshold), with a separate `trim_threshold` before
+   a holding is sold on the buy-side scoreboard.
+5. **Benchmark.** Every evaluation compares to BTC and an equal-weight basket;
+   `pipeline.run` now records an equity snapshot per cycle so the curve exists.
+6. **Portfolio risk.** `portfolio_risk.py` caps the **correlation-adjusted**
+   risk of the BUY slate — `sqrt(r' C r)` against `max_portfolio_heat_pct` of
+   equity — so three 1%-risk alt longs that move together aren't quietly one
+   2.5% bet. The regime gate is the macro switch; this is the micro one.
+
+Every one of these is behind a config flag with the old behaviour still
+reachable — see `build_notebook.py`'s Configuration cell.
+
+Also from the review: the regime verdict is **persisted per cycle**
+(`regime_log`) and `evaluation.regime_effectiveness()` measures whether
+`risk_off` runs actually preceded weaker returns; realised fees are a
+first-class `orders.fee_usd` column (not JSON spelunking); `recommend_weights`
+now leads with a **`blend_verdict`** — does the composite even beat its own best
+single component?; and the slippage guard is read through
+`execution.entry_slippage_guard_bps`, which can never sit below the limit
+cross.
+
+---
+
 ## What this is, and what it isn't
 
 **It ranks; it does not predict.** Nothing can identify the three trades that
 *will* maximise profit over the next week. What this does is score every asset
 with a visible, hand-tuned formula, expose every component behind each score,
-and size positions against a stated risk budget.
+size positions against a stated risk budget, and **now measure itself against
+realised returns** so you can tell whether any of it works.
 
 The weights in `ScoreWeights` and the impact priors in `EVENT_TYPES` were
-chosen by hand. **They have not been fitted to realised returns, and this has
-not been backtested.** The value on offer is legibility — you can see exactly
-why an asset ranked where it did, and change any weight you disagree with.
+chosen by hand. **They have not been fitted to realised returns.** Run
+`evaluation.summary(store, CONFIG)` after a few weeks; once a family's IC clears
+|t| ≥ 2, `evaluation.recommend_weights()` prints the weight vector to use
+instead. Until then the value on offer is legibility — you can see exactly why
+an asset ranked where it did, and change any weight you disagree with.
 
 **On signal quality.** Reddit mention volume is trivially gamed and mostly
 lagging; by the time a coin trends on r/wallstreetbets the move that caused the
@@ -49,15 +106,20 @@ This is not financial advice. You approve every trade; you own every outcome.
 ## Layout
 
 ```
-crypto_yolo_dashboard.ipynb   the dashboard (generated — edit build_notebook.py)
-build_notebook.py             regenerates the notebook
+crypto_yolo_dashboard.ipynb   the dashboard — GENERATED and gitignored; run
+                              `python3 build_notebook.py` to (re)create it
+build_notebook.py             the notebook's real source
 collect.py                    scheduled collector entry point (path-independent)
 run_cycle.py                  one trading cycle from the CLI (--auto-approve lives here)
+backfill_prices.py            one-off: fill prices_daily for the runs already logged
 com.crypto-yolo.collector.plist   launchd job, runs collect.py every 8h
+com.crypto-yolo.trader.plist      launchd job, runs one paper cycle a day
 cryptoyolo/
-  config.py       universe, weights, risk, execution settings, env loading
+  config.py       universe, weights, risk, fees, regime, events, execution,
+                  notifications; env loading
   store.py        SQLite: posts, mentions, catalysts, scores, proposals, orders,
-                  position_meta (entry terms that exits evaluate against)
+                  position_meta, equity_snapshots (the equity curve), prices_daily
+                  (point-in-time closes for a reproducible evaluation)
   prices.py       OHLCV from Binance.US / Coinbase / Kraken / yfinance
   indicators.py   Bollinger, Keltner, Donchian, RSI, MACD, ATR
   charts.py       plotly candlesticks, universe grid, score attribution
@@ -67,13 +129,20 @@ cryptoyolo/
   feeds.py        Feature 2b — StockTwits cashtags, Mastodon hashtags, 4chan /biz/
   positioning.py  Feature 4 — perpetual funding rates as a crowding measure
   catalysts.py    Feature 3 — GitHub releases, news RSS, event taxonomy
+  calendar_events.py  Feature 5 — scheduled dated events (unlocks, mainnets, ETF dates)
+  regime.py       BTC-trend regime gate: how much long exposure the tape justifies
+  portfolio_risk.py  correlation matrix + sqrt(r' C r) heat of a candidate slate
   exits.py        five configurable exit triggers for open positions
-  engine.py       scoring, ranking, risk-based position sizing
-  broker.py       signed Binance REST client + paper broker
+  engine.py       scoring (5 families + xsec momentum), ranking, risk-based sizing
+  broker.py       signed Binance REST client + paper broker + the fee/slippage model
   approval.py     per-trade approval gate
-  pipeline.py     end-to-end orchestration
+  pipeline.py     end-to-end orchestration (equity snapshot + structured summary per cycle)
+  evaluation.py   the feedback loop: forward-return IC, realised trades, benchmark
+  logsetup.py     rotating log file in data/ + stderr, for the unattended jobs
+  notify.py       best-effort alerts (ntfy / webhook / macOS banner)
   scheduler.py    in-kernel collector thread (dies with the kernel)
-data/             SQLite database (gitignored)
+tests/            pytest suite — `pip install -r requirements-dev.txt && pytest`
+data/             SQLite database + logs (gitignored)
 ```
 
 ---
@@ -276,10 +345,13 @@ something different for BTC than for a thin altcoin. Read **contrarian** by
 default (crowded positioning is fragile positioning); `contrarian=False` reads it
 as momentum confirmation instead. Both are defensible; neither is tested here.
 
-**Weights:** `positioning` was added at 0.10 alongside the existing
-0.50/0.20/0.30. Since `normalized()` divides by the sum, the other three keep
-their exact ratios — the effective split becomes 0.45/0.18/0.27/0.09. Set
-`positioning = 0.0` to restore the previous three-family composite.
+**Weights:** families are added without rescaling the others — `normalized()`
+divides by the sum, so `positioning = 0.10` alongside `0.50/0.20/0.30` just
+makes room and every prior ratio holds. `events` ships at **0.0** because its
+schedule is empty — a non-zero weight on an all-zero family only dilutes the
+rest; raise it to ~0.15 once you populate `SCHEDULED_EVENTS`. Set any weight to
+`0.0` to drop that family. Don't trust these numbers — run `evaluation` and use
+`recommend_weights()`.
 
 A caveat visible today: all 20 assets currently sit at the funding cap, so
 positioning applies a near-uniform bearish tilt. The **discrimination** comes
@@ -296,6 +368,36 @@ direction — `record ETF inflows` and `ETF outflows accelerate` point opposite
 ways. Topic-type events take their sign from the headline's own tone;
 intrinsically directional events (an exploit is never good news) keep their
 prior and are discounted when tone disagrees.
+
+This family scores news that has *already been published* — which
+`evaluation` tends to show is a reaction, not a lead. For the forward-looking
+version, see Feature 5.
+
+### 5 · Scheduled events (the forward-looking family)
+
+`calendar_events.py`. Events with a **known future date** — token unlocks,
+mainnet launches, ETF decision deadlines, listing effective dates — scored by
+how close the date is and how big the event is, on a tent function that ramps up
+as the date approaches, holds through `peak_window_days`, then decays after.
+Token-unlock magnitude is `% of circulating supply`; everything else is a 0–1
+size. Events combine as a signed saturating sum.
+
+The schedule is **hand-maintained in `config.py::SCHEDULED_EVENTS` and ships
+empty** — this family scores 0 until you populate it. Optionally set
+`events.fetch_unlocks` + `unlocks_url` to pull from a public unlock feed
+(best-effort, fails quietly). This is the one input that is genuinely knowable
+in advance rather than a reaction to a move that already happened.
+
+### Cross-sectional momentum
+
+Not a family — a blend coefficient. `technical_final = (1 −
+xsec_momentum_blend)·technical + xsec_momentum_blend·xsec`, where `xsec` is the
+asset's trailing-return rank (≈1-month and 3-month) z-scored **across the
+universe** and squashed to [−1, 1]. The isolated technical score only ever sees
+an asset against its own history; ranking it against the other 19 is one of the
+few crypto factors that survives out-of-sample. Set the blend to `0.0` to
+restore the isolated score. `technical_raw` and `xsec` are both exposed in the
+score table.
 
 ### Exit management
 
@@ -416,21 +518,54 @@ assets you *do* hold become SELL (exit) proposals.
 
 ## Position sizing
 
-Risk-first, not fixed-dollar. Stop distance is `1.5 × ATR(14)` on **daily**
-candles — matching the 1-to-7 day horizon — and quantity is set so that being
-stopped out costs exactly `risk_per_trade_pct` of equity.
+Risk-first, not fixed-dollar. Quantity is set so that being stopped out costs
+exactly `risk_per_trade_pct` of the **risk basis**.
 
-Sizing off hourly ATR (the obvious mistake) produces sub-1% stops that get taken
-out by ordinary intraday noise. Positions are capped per-trade
-(`max_position_pct`) and in aggregate (`max_total_deployed_pct`); when a cap
-binds, buys scale down proportionally so the ranking is preserved.
+**Risk basis is live equity** (`risk.size_off_live_equity`, default on): cash
+plus marked-to-market positions, recomputed every cycle. So the budget grows
+after a good stretch and shrinks in a drawdown without a config edit.
+`account_equity_usd` is only the fallback when live equity can't be read.
+
+**Stop distance is scaled to the holding horizon** (`risk.stop_scaling =
+"horizon"`): `atr_stop_mult · dailyATR(14) · √stop_horizon_days`, clamped to
+`[stop_min_pct, stop_max_pct]`. The old `1.5 · dailyATR` stop was ~3-5% for a
+major — inside one day's range, so a multi-week thesis got whipsawed out on
+noise. `√10 ≈ 3.2×` wider fixes that; position size shrinks to hold the dollar
+risk at `risk_per_trade_pct`. Set `stop_scaling = "legacy"` for the old stop.
+Sizing off *hourly* ATR (the original mistake, now impossible) produced sub-1%
+stops.
+
+**Targets clear fees.** With `risk.fee_adjust_targets` the take-profit distance
+is solved so the *net* reward:risk — the full round-trip cost (fees **and**
+slippage, both legs) taken off the reward and added to the risk — comes out to
+exactly `reward_risk_target`, then clamped at `target_pct_cap` of entry. The
+ticket shows both gross and net R:R; if the cap or the regime scaler bit, net
+R:R prints below target and that's the honest number.
+
+**The regime gate scales the slate.** `regime.assess()` reads BTC's daily chart
+with a `ma_band_pct` (default 2%) dead-band around the MA: `risk_on` (price
+> MA·1.02 and the MA rising) → full size; `neutral` (inside the band, or above a
+flat/falling MA) → `×neutral_exposure` (0.5); `risk_off` (price < MA·0.98, or a
+deep drawdown) → new BUYs dropped entirely. If fewer than `regime.min_candles`
+daily bars are available the gate abstains (neutral). The deployment cap is
+multiplied by this. Exits are never gated.
+
+**Correlation heat cap.** After the deployment/regime cap, `portfolio_risk`
+computes `heat = sqrt(r' C r)` over the new BUY slate — `r` the per-trade dollar
+risk, `C` the trailing `corr_lookback_days` return-correlation matrix (missing
+pairs default to 0.8). If `heat` exceeds `max_portfolio_heat_pct` of equity the
+whole slate scales down, and the run prints the heat, the perfectly-correlated
+`gross`, and the `diversification_ratio` (heat / gross). Set
+`correlation_sizing = False` to fall back to the gross deployment cap only.
+
+Positions are capped per-trade (`max_position_pct`) and in aggregate
+(`max_total_deployed_pct × regime scale`); when a cap binds, buys scale down
+proportionally so the ranking is preserved.
 
 ### Purchases never exceed available cash
 
-`account_equity_usd` is the **risk basis**, not a spending limit — it sets how
-much you're willing to lose per trade. Spending is capped separately against
-your real balance, in three places, because each catches something the others
-miss:
+Spending is capped separately against your real balance, in three places,
+because each catches something the others miss:
 
 1. **Per trade** — no single BUY exceeds the spendable balance.
 2. **Per slate** — total BUY notional is capped at the balance. Three
@@ -448,8 +583,68 @@ spent. If the balance can't be read (no credentials, API error) the cap is
 skipped rather than guessed: unknown is treated as unknown, not as zero, and
 preflight warns per trade instead.
 
-SELLs are exempt from both caps — an exit releases capital rather than consuming
-it — and are separately capped at the quantity you actually hold.
+SELLs are exempt from the cash cap, the deployment cap **and the regime gate** —
+an exit releases capital and reduces risk — and are separately capped at the
+quantity you actually hold.
+
+---
+
+## Fees and execution cost
+
+`CONFIG.fees` (`FeeConfig`). Binance.US charges ~40 bps taker/maker at the base
+tier — a ~0.8% round trip, an order of magnitude above Binance.com. Against a 2R
+target of ~8% that is a large slice of the edge, so it is now modelled
+everywhere:
+
+| Lever | Effect |
+|---|---|
+| `use_bnb_discount` | pay fees in BNB for a 25% cut (`bnb_discount_pct`) |
+| lower the `taker_bps` / `maker_bps` | as you earn a lower fee tier with volume |
+| `execution.entry_order_type = "LIMIT"` | entries cross the book by at most `entry_limit_cross_bps` — slippage is **capped**, not open-ended; exits stay MARKET so they always fill |
+| `execution.max_entry_slippage_bps` | refuse an entry outright if the market has gapped past this vs the proposal price |
+| `fees.slippage_bps` | modelled cost applied to **paper** fills, so the paper record isn't better than a live account can be |
+
+Every proposal ticket shows `fee ≈ $x/side` and `R:R gross / net`. Paper fills
+record the modelled fee and slippage in the order row, which is what lets
+`evaluation` report fee drag as a share of realised P&L.
+
+---
+
+## Evaluation — did any of it work?
+
+`evaluation.py`. Run it from the notebook (the **Evaluation & benchmark**
+section) or directly:
+
+```python
+from cryptoyolo import evaluation
+report = evaluation.summary(store, CONFIG)          # prints the full battery
+evaluation.recommend_weights(report["forward_returns"])   # data-driven ScoreWeights
+```
+
+| Function | Answers |
+|---|---|
+| `forward_returns` | for every stored score, the asset's realised 1d/7d/30d return |
+| `information_coefficient` | per-family Spearman IC, **per-run mean with an overlap-deflated t-stat** (`runs_eff` shows the effective independent-sample count — daily runs sharing a 7/30d window are not independent) plus a pooled IC |
+| `quantile_spread` | mean forward return of the top-N composite minus the bottom-N — does the ranking separate anything? |
+| `hit_rate` | share of bullish (bearish) calls that went up (down) |
+| `realized_trades` / `trade_stats` | FIFO round-trip reconstruction from the order log (realised fee from the `orders.fee_usd` column, then the response blob, then an estimate): win rate, avg win/loss, profit factor, **fee drag as % of gross P&L** |
+| `benchmark_returns` | buy-and-hold BTC and an equal-weight basket over the same window |
+| `equity_stats` | total return, annualised Sharpe, max drawdown of the equity curve, and the gap vs BTC — restricted to **one** snapshot mode (paper and live never share a curve) |
+| `regime_effectiveness` | realised forward return of the universe / top-N per recorded regime state — did `risk_off` runs actually precede weaker returns? |
+| `recommend_weights` | leads with **`blend_verdict`** (does the composite beat its own best single component?); then weights ∝ measured IC, zeroed for any family with \|t\| < 2, keeping the hand-set weights if fewer than two families clear |
+
+**With a few weeks of data every number is noisy.** A t-stat under ~2 is "no
+evidence", not a finding. The equity curve needs `pipeline.run` to have recorded
+snapshots on different days — it writes one per cycle to `equity_snapshots`.
+
+**Prices are read from a local table, not re-fetched.** Forward returns and the
+BTC / basket benchmark come from `prices_daily` — point-in-time daily closes
+written every cycle by `build_scores` (and by `collect.py --prices`). So the IC,
+Sharpe and benchmark numbers are the same each time you recompute them, and
+`evaluation` runs with no network. Runs logged before this table existed have no
+prices yet — run `./backfill_prices.py` once to fill them in
+(`./backfill_prices.py --status` shows coverage). If a symbol still has no local
+history the module falls back to a live fetch and stores the result.
 
 ---
 
@@ -492,6 +687,28 @@ realised returns, so auto-approving into a live account is betting real money on
 untested heuristics with nobody watching. Paper mode exists precisely so you can
 gather that evidence first.
 
+### Run one paper cycle a day (macOS launchd)
+
+The evaluation module is only as good as the record it scores. `collect.py` on a
+schedule keeps the *inputs* fresh, but scores, proposals, equity snapshots and
+regime verdicts only accrue when a cycle actually runs — so the equity curve,
+the BTC benchmark and `regime_effectiveness()` never fill in if you only run the
+notebook occasionally. `com.crypto-yolo.trader.plist` runs one unattended cycle
+a day to close that gap:
+
+```bash
+cp com.crypto-yolo.trader.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.crypto-yolo.trader.plist
+./run_cycle.py --auto-approve --paper      # run once by hand to confirm
+```
+
+It runs `run_cycle.py --auto-approve --paper` at 13:05 local — after the 08:00
+collector pass, and clear of it so the two don't write SQLite at the same
+instant. `--paper` is a hard floor: this job **cannot** place a live order even
+if `CONFIG.execution.mode` is switched to `binance` for your manual runs. Output
+goes to `data/trader.log` (raw) and `data/crypto-yolo.log` (structured, rotated).
+`launchctl unload ~/Library/LaunchAgents/com.crypto-yolo.trader.plist` stops it.
+
 ## Running the collector on a schedule
 
 Feature 2 is only as good as its baseline: mention *velocity* is measured against
@@ -505,10 +722,15 @@ any directory — `python3 -m cryptoyolo.scheduler` only resolves when cwd happe
 to be the project root, which neither launchd nor cron guarantees.
 
 ```bash
-./collect.py --catalysts    # Reddit + news + GitHub — what the scheduled job runs
-./collect.py                # Reddit only (faster)
-./collect.py --status       # what's collected so far, no network calls
+./collect.py --catalysts --prices   # Reddit + news + GitHub + daily closes — the scheduled job
+./collect.py                        # Reddit only (faster)
+./collect.py --status               # what's collected so far, no network calls
 ```
+
+`--prices` sweeps 1y of daily closes for the universe into the `prices_daily`
+table, so `evaluation` always has a local price record even on days no trading
+cycle runs. `build_scores` writes the same rows every cycle, so this is a
+freshness top-up, not a requirement.
 
 An `flock` guard means overlapping runs are impossible: if one pass stalls on a
 slow feed, the next trigger exits immediately rather than stacking a second
@@ -566,6 +788,40 @@ the environment at runtime, and `.env` is gitignored.
 | `BINANCE_API_KEY` / `BINANCE_API_SECRET` | Execution | paper mode works fully |
 | `GITHUB_TOKEN` | Feature 3 | works; 60 req/hr caps the scan |
 | `CRYPTO_YOLO_ALLOW_LIVE` | Live orders | orders stay validate-only |
+| `CRYPTO_YOLO_LOG_LEVEL` | log verbosity (`INFO` default) | INFO |
+| `CRYPTO_YOLO_NTFY_URL` | push alerts via [ntfy](https://ntfy.sh) | alerts still logged + macOS banner |
+| `CRYPTO_YOLO_ALERT_WEBHOOK` | Slack/Discord alert webhook | as above |
+
+---
+
+## Logging and alerts
+
+The unattended jobs log through `cryptoyolo/logsetup.py`: a rotating
+`data/crypto-yolo.log` (2 MB × 5) plus stderr, with timestamps and levels. The
+human `print()` transcript is unchanged — `data/collector.log` and
+`data/trader.log` still hold that. Every cycle also logs one structured summary
+line (`cycle … regime=… proposals=… executed=… rejected=… equity=…`), and
+`pipeline.run` returns it under `result["summary"]`.
+
+`cryptoyolo/notify.py` sends best-effort alerts — via an ntfy topic, a
+Slack/Discord webhook, and/or a macOS Notification Center banner — for the
+events in `CONFIG.notify`: an order rejected, a stop/target/trailing/horizon
+exit filling, the regime gate going `risk_off`, the price feed falling through
+to yfinance, and equity drawing down past `notify.drawdown_alert_pct` (10%).
+Routine fills are off by default. With nothing configured an alert is just a log
+line. `CONFIG.notify.enabled = False` turns it all off.
+
+## Development
+
+```bash
+pip install -r requirements-dev.txt
+pytest                          # ~40 tests, no network, throwaway SQLite
+python3 build_notebook.py       # regenerate the (gitignored) notebook
+```
+
+The repo is under git; `data/` (history, logs, the SQLite file) and the
+generated notebook are ignored. Tests never open `data/` — they run against a
+`tmp_path` database.
 
 ---
 
