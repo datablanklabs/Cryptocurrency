@@ -126,6 +126,13 @@ def main() -> int:
             log.exception("funding fetch failed")
             print(f"  ! funding fetch failed: {exc}")
 
+        from cryptoyolo import macro
+        try:
+            macro.fetch(store, CONFIG, verbose=True)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("macro fetch failed")
+            print(f"  ! macro fetch failed: {exc}")
+
         if args.catalysts:
             from cryptoyolo import catalysts
             try:

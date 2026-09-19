@@ -130,7 +130,9 @@ cryptoyolo/
   positioning.py  Feature 4 — perpetual funding rates as a crowding measure
   catalysts.py    Feature 3 — GitHub releases, news RSS, event taxonomy
   calendar_events.py  Feature 5 — scheduled dated events (unlocks, mainnets, ETF dates)
-  regime.py       BTC-trend regime gate: how much long exposure the tape justifies
+  macro.py        Feature 6 — Kalshi event-contract prices (Fed, CPI, shutdown risk, ...)
+  regime.py       BTC-trend regime gate: how much long exposure the tape justifies,
+                  dampened (never boosted) by macro.py's read
   portfolio_risk.py  correlation matrix + sqrt(r' C r) heat of a candidate slate
   exits.py        five configurable exit triggers for open positions
   engine.py       scoring (5 families + xsec momentum), ranking, risk-based sizing
@@ -388,6 +390,32 @@ empty** — this family scores 0 until you populate it. Optionally set
 (best-effort, fails quietly). This is the one input that is genuinely knowable
 in advance rather than a reaction to a move that already happened.
 
+### 6 · Macro backdrop (Kalshi event contracts)
+
+`macro.py`. Not a scored family like the five above — it feeds `regime.py`
+instead. Kalshi is a CFTC-regulated prediction market: a contract settles at
+$1 if a YES proposition resolves true, $0 otherwise, so its live price *is* a
+market-implied probability. `config.py::MACRO_SERIES` is a hand-maintained
+list of series to read — Fed rate decisions, CPI prints, government-shutdown
+risk, recession odds — the kind of broad macro uncertainty that moves risk
+assets generally, crypto included, in a way nothing else here can see coming.
+
+Each series contributes `direction × (probability − 0.5) × 2 × weight` to a
+weight-normalised blend in [-1, 1]: a contract priced at a coin flip (50%)
+contributes nothing, one priced near-certain contributes its full weight.
+`direction` (does a YES resolution favor or hurt risk assets?) is a hand-set
+prior, same spirit as `catalysts.py`'s `EVENT_TYPES` — argue with it in
+`MACRO_SERIES`.
+
+**Ships empty, like `SCHEDULED_EVENTS`.** The series tickers are placeholders,
+not verified — Kalshi's catalog changes and this repo can't know today's exact
+strings. Run `cryptoyolo.macro.list_series(query="fed")` (needs working
+credentials) to find the real ones. Needs a Kalshi API key (RSA key pair, see
+`.env.example`); without one, `fetch()` skips and the regime fold-in is a
+no-op.
+
+**Only ever dampens, never boosts.** See the regime section below.
+
 ### Cross-sectional momentum
 
 Not a family — a blend coefficient. `technical_final = (1 −
@@ -549,6 +577,17 @@ flat/falling MA) → `×neutral_exposure` (0.5); `risk_off` (price < MA·0.98, o
 deep drawdown) → new BUYs dropped entirely. If fewer than `regime.min_candles`
 daily bars are available the gate abstains (neutral). The deployment cap is
 multiplied by this. Exits are never gated.
+
+**Macro can dampen the gate further, never loosen it.** When `regime.assess()`
+is called with a `store` (as the pipeline does), it folds in `macro.py`'s
+Kalshi-derived score: a bad-but-not-extreme reading multiplies exposure down
+by up to `1 - macro_downweight` (floored at `macro_min_multiplier`); a reading
+at or below `macro_risk_off_threshold` (default -0.6) forces `risk_off`
+outright, regardless of what the BTC trend alone said. A calm or supportive
+macro reading never increases exposure past what the trend earned — this
+input only ever removes risk. Silently skipped (no adjustment) whenever
+`MACRO_SERIES` is empty, Kalshi isn't configured, or the snapshot is older
+than `macro.stale_after_hours`.
 
 **Correlation heat cap.** After the deployment/regime cap, `portfolio_risk`
 computes `heat = sqrt(r' C r)` over the new BUY slate — `r` the per-trade dollar
@@ -787,6 +826,7 @@ the environment at runtime, and `.env` is gitignored.
 | `REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET` | Feature 2 | falls back to keyless sources; still works |
 | `BINANCE_API_KEY` / `BINANCE_API_SECRET` | Execution | paper mode works fully |
 | `GITHUB_TOKEN` | Feature 3 | works; 60 req/hr caps the scan |
+| `KALSHI_API_KEY_ID` / `KALSHI_PRIVATE_KEY_PATH` | Feature 6 (macro regime dampener) | macro fetch skips; regime fold-in is a no-op |
 | `CRYPTO_YOLO_ALLOW_LIVE` | Live orders | orders stay validate-only |
 | `CRYPTO_YOLO_LOG_LEVEL` | log verbosity (`INFO` default) | INFO |
 | `CRYPTO_YOLO_NTFY_URL` | push alerts via [ntfy](https://ntfy.sh) | alerts still logged + macOS banner |
@@ -815,7 +855,7 @@ line. `CONFIG.notify.enabled = False` turns it all off.
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                          # ~40 tests, no network, throwaway SQLite
+pytest                          # ~65 tests, no network, throwaway SQLite
 python3 build_notebook.py       # regenerate the (gitignored) notebook
 ```
 
@@ -829,4 +869,7 @@ generated notebook are ignored. Tests never open `data/` — they run against a
 
 Everything needed is already installed in this environment. `ccxt`, `praw`,
 `feedparser` and `vaderSentiment` are deliberately *not* used — see
-`requirements.txt` for why.
+`requirements.txt` for why. `cryptography` is a real dependency, not
+optional-in-practice like the others above: `macro.py` imports it
+unconditionally to RSA-PSS-sign Kalshi requests, even though `macro.fetch()`
+itself is a no-op without `KALSHI_API_KEY_ID` set.

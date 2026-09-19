@@ -10,6 +10,11 @@ nbformat>=5.9
 # Optional price fallback (used only if Binance/Coinbase/Kraken all fail).
 yfinance>=0.2.40
 
+# Kalshi's signed-request auth (macro.py, Feature 6): RSA-PSS signing of every
+# request. Optional in the sense that macro.py degrades to a no-op without
+# KALSHI_API_KEY_ID set, but the import itself is unconditional.
+cryptography>=41.0
+
 # Deliberately NOT required:
 #   ccxt        — Binance REST is called directly (broker.py); one less dependency
 #                 between you and the order you're placing.

@@ -49,6 +49,7 @@ a backstop, since stop, target, trailing and score-reversal usually fire first.
 | **3 · Dev & news catalysts** | GitHub releases, CoinDesk/Cointelegraph/Decrypt/Defiant | catalyst score |
 | **4 · Positioning** | OKX perpetual funding rates | positioning score |
 | **5 · Scheduled events** | hand-maintained calendar (unlocks, mainnets, ETF dates) | events score |
+| **6 · Macro backdrop** | Kalshi event-contract prices (Fed, CPI, shutdown risk) | dampens the regime gate |
 
 Sizing is against **live equity**, the stop is scaled to the holding horizon,
 targets are widened to clear round-trip fees, and a **BTC-trend regime gate**
@@ -118,6 +119,7 @@ from cryptoyolo import (charts, engine, evaluation, indicators, pipeline, prices
 from cryptoyolo import calendar_events as events_mod
 from cryptoyolo import catalysts as catalysts_mod
 from cryptoyolo import feeds as feeds_mod
+from cryptoyolo import macro as macro_mod
 from cryptoyolo import social as social_mod
 from cryptoyolo.config import CONFIG, TIMEFRAMES, load_dotenv
 from cryptoyolo.store import Store
@@ -129,7 +131,8 @@ store = Store(CONFIG.db_path)
 # rather than letting a later cell die on a missing attribute.
 _required = {"exits": "exit management", "risk": "risk sizing",
              "execution": "order execution", "fees": "fee model",
-             "regime": "regime gate", "events": "scheduled events"}
+             "regime": "regime gate", "events": "scheduled events",
+             "macro": "macro backdrop (Kalshi)"}
 _missing = [f"CONFIG.{a} ({why})" for a, why in _required.items()
             if not hasattr(CONFIG, a)]
 if _missing:
@@ -154,6 +157,7 @@ Nothing is hard-coded. Create a `.env` next to this notebook (see `.env.example`
 | `REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET` | Feature 2 | falls back to keyless sources — still works |
 | `BINANCE_API_KEY` / `BINANCE_API_SECRET` | Execution | paper mode still works fully |
 | `GITHUB_TOKEN` | Feature 3 | works, but 60 req/hr caps the universe scan |
+| `KALSHI_API_KEY_ID` / `KALSHI_PRIVATE_KEY_PATH` | Feature 6 | macro fetch skips; regime gate runs on BTC trend alone |
 | `CRYPTO_YOLO_ALLOW_LIVE=1` | Live orders | orders stay validate-only |
 
 Reddit credentials are **optional** — the scraper falls back to Arctic Shift (a
@@ -226,6 +230,19 @@ CONFIG.regime.ma_band_pct                    = 2.0   # dead-band so an MA chop d
 CONFIG.regime.neutral_exposure               = 0.5
 CONFIG.regime.risk_off_exposure              = 0.0
 CONFIG.regime.block_new_entries_when_risk_off = True
+
+# ── Macro backdrop (Feature 6 — Kalshi, dampens the regime gate above) ──
+# Only ever DAMPENS exposure_scale, never boosts it. A macro score at/below
+# macro_risk_off_threshold forces risk_off outright; anything less extreme
+# scales exposure down by up to (1 - macro_downweight), floored at
+# macro_min_multiplier. Ships a no-op: config.py::MACRO_SERIES is empty
+# until you populate it with real Kalshi series tickers (see Feature 6).
+CONFIG.regime.macro_enabled            = True
+CONFIG.regime.macro_risk_off_threshold = -0.6
+CONFIG.regime.macro_downweight         = 0.5
+CONFIG.macro.enabled                   = True
+CONFIG.macro.min_volume                = 1       # ignore untraded (meaningless-price) markets
+CONFIG.macro.stale_after_hours         = 36.0    # older snapshot = treated as no-data
 
 # ── Scheduled events (Feature 5 — the one forward-looking family) ───────
 # Token unlocks, mainnet dates, ETF decisions, listing effective dates. The
@@ -336,7 +353,9 @@ print(f"heat cap   : {'on' if CONFIG.risk.correlation_sizing else 'OFF'}, "
 from cryptoyolo.broker import execution_banner
 from cryptoyolo import regime as _regime
 print(f"execution  : {execution_banner(CONFIG)}")
-print(f"regime     : {_regime.describe(_regime.assess(CONFIG))}")
+# store=store folds in the last Kalshi macro snapshot (if any) — see
+# Feature 6 below. Without it this line would only ever show the BTC trend.
+print(f"regime     : {_regime.describe(_regime.assess(CONFIG, store=store))}")
 """),
 
 md(r"""
@@ -699,6 +718,45 @@ _pos = (pos_scores["positioning"] > 0.01).sum()
 print(f"\ncrowded long (scores bearish): {_neg}   crowded short (scores bullish): {_pos}")
 print("A uniform tilt shifts every composite together; the DISCRIMINATION comes")
 print("from the z-magnitude, so compare assets to each other, not to zero.")
+"""),
+
+md(r"""
+---
+## Feature 6 · Macro backdrop (Kalshi event contracts)
+
+Not a scored family like the five above — this one feeds the **regime gate**,
+not the composite. Kalshi is a CFTC-regulated prediction market: a contract
+settles at \$1 if a YES proposition resolves true, \$0 otherwise, so its live
+price *is* a market-implied probability. `CONFIG` reads a hand-maintained list
+of series (`config.py::MACRO_SERIES` — Fed decisions, CPI prints,
+government-shutdown risk) and blends them into one score that can only ever
+**dampen** the BTC-trend deployment scale, never boost it.
+
+`MACRO_SERIES` ships empty — until you populate it with real Kalshi series
+tickers (run `macro_mod.list_series(CONFIG, query="fed")` with working
+credentials to find them), this section reports "no data" and the regime gate
+runs exactly as it did before this feature existed.
+"""),
+
+code(r"""
+n_macro = macro_mod.fetch(store, CONFIG, verbose=True)
+
+macro_read = macro_mod.score(store, CONFIG)
+print(f"\n{macro_mod.describe(macro_read)}")
+if not macro_read["detail"].empty:
+    display(macro_read["detail"].style.format({
+        "probability": "{:.0%}", "contribution": "{:+.3f}", "weight": "{:.2f}",
+    }).hide(axis="index"))
+"""),
+
+code(r"""
+# Snapshot: where each configured series stands right now.
+charts.macro_chart(macro_read["detail"]).show()
+
+# History: how it got there. Builds up one point per macro.fetch() call (this
+# cell, plus the 8-hourly collector job if it's running) — a single point is
+# expected right after first setting this feature up.
+charts.macro_history_chart(store.macro_history()).show()
 """),
 
 md(r"""
