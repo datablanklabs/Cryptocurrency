@@ -73,3 +73,32 @@ def test_high_water_only_ratchets_up(store: Store):
     assert store.bump_high_water("SOL", 115.0) == 115.0
     assert store.bump_high_water("SOL", 108.0) == 115.0        # a dip never lowers it
     assert store.bump_high_water("SOL", 120.0) == 120.0
+
+
+def test_macro_markets_latest_is_newest_row_per_ticker(store: Store):
+    store.upsert_macro([
+        {"ticker": "KXFED-1", "series_ticker": "KXFED", "label": "Fed cuts",
+         "title": "t1", "probability": 0.5, "volume": 10, "close_time": "c1",
+         "fetched_at": "2026-01-01T00:00:00+00:00"},
+        {"ticker": "KXFED-1", "series_ticker": "KXFED", "label": "Fed cuts",
+         "title": "t1", "probability": 0.6, "volume": 20, "close_time": "c1",
+         "fetched_at": "2026-01-02T00:00:00+00:00"},
+    ])
+    latest = store.macro_latest()
+    assert len(latest) == 1
+    assert latest["probability"].iloc[0] == 0.6      # newest fetch wins
+
+    hist = store.macro_history("KXFED")
+    assert len(hist) == 2                            # full history is kept, not overwritten
+
+
+def test_macro_latest_drops_rows_older_than_since(store: Store):
+    from datetime import datetime, timezone
+
+    store.upsert_macro([
+        {"ticker": "KXOLD-1", "series_ticker": "KXOLD", "label": "old",
+         "title": "", "probability": 0.5, "volume": 5, "close_time": "",
+         "fetched_at": "2020-01-01T00:00:00+00:00"},
+    ])
+    assert store.macro_latest(datetime(2025, 1, 1, tzinfo=timezone.utc)).empty
+    assert not store.macro_latest().empty
