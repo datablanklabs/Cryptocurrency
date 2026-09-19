@@ -250,6 +250,23 @@ CREATE INDEX IF NOT EXISTS idx_regime_ts ON regime_log(ts);
 -- forward returns from THIS table rather than re-pulling a sliding window from a
 -- live API on every call, which is what makes its IC / Sharpe / benchmark
 -- numbers reproducible and lets the whole module run with no network.
+-- Kalshi event-contract snapshots (Feature 6, macro.py). One row per
+-- (ticker, fetched_at): appended rather than upserted-in-place, same as
+-- funding_rates, so a series' probability history is preserved for later
+-- evaluation, not just its current reading.
+CREATE TABLE IF NOT EXISTS macro_markets (
+    ticker        TEXT NOT NULL,
+    series_ticker TEXT NOT NULL,
+    label         TEXT,
+    title         TEXT,
+    probability   REAL NOT NULL,       -- implied P(YES), 0..1
+    volume        INTEGER,
+    close_time    TEXT,
+    fetched_at    TEXT NOT NULL,
+    PRIMARY KEY (ticker, fetched_at)
+);
+CREATE INDEX IF NOT EXISTS idx_macro_series ON macro_markets(series_ticker, fetched_at);
+
 CREATE TABLE IF NOT EXISTS prices_daily (
     symbol     TEXT NOT NULL,
     date       TEXT NOT NULL,          -- 'YYYY-MM-DD' (UTC)
@@ -677,6 +694,48 @@ class Store:
             params = (symbol,)
         with self.conn() as con:
             return pd.read_sql_query(q + " ORDER BY funding_time ASC", con, params=params)
+
+    # -- macro (Kalshi) ------------------------------------------------------
+    def upsert_macro(self, rows: Iterable[dict[str, Any]]) -> int:
+        rows = list(rows)
+        if not rows:
+            return 0
+        with self.conn() as con:
+            cur = con.executemany(
+                """INSERT INTO macro_markets
+                   (ticker, series_ticker, label, title, probability, volume,
+                    close_time, fetched_at)
+                   VALUES (:ticker,:series_ticker,:label,:title,:probability,
+                           :volume,:close_time,:fetched_at)
+                   ON CONFLICT(ticker, fetched_at) DO UPDATE SET
+                     probability=excluded.probability, volume=excluded.volume""",
+                rows,
+            )
+            return cur.rowcount
+
+    def macro_latest(self, since: datetime | None = None) -> pd.DataFrame:
+        """The most recent stored row per ticker, optionally dropping any
+        ticker whose latest row is older than `since` (stale = no-data, not
+        "use an old number")."""
+        q = """SELECT m.* FROM macro_markets m
+               JOIN (SELECT ticker, MAX(fetched_at) AS mx FROM macro_markets
+                     GROUP BY ticker) t
+                 ON m.ticker = t.ticker AND m.fetched_at = t.mx"""
+        params: tuple = ()
+        if since is not None:
+            q += " WHERE m.fetched_at >= ?"
+            params = (since.isoformat(),)
+        with self.conn() as con:
+            return pd.read_sql_query(q, con, params=params)
+
+    def macro_history(self, series_ticker: str | None = None) -> pd.DataFrame:
+        q = "SELECT * FROM macro_markets"
+        params: tuple = ()
+        if series_ticker:
+            q += " WHERE series_ticker = ?"
+            params = (series_ticker,)
+        with self.conn() as con:
+            return pd.read_sql_query(q + " ORDER BY fetched_at ASC", con, params=params)
 
     # -- source ranking -----------------------------------------------------
     def save_source_rank(self, rows: Iterable[dict[str, Any]]) -> None:

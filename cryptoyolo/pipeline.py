@@ -13,7 +13,7 @@ from typing import Any, Callable
 import pandas as pd
 
 from . import (approval, broker as broker_mod, catalysts, engine, exits, feeds,
-               positioning, regime as regime_mod, social)
+               macro, positioning, regime as regime_mod, social)
 from .config import CONFIG, Config, credential_status, load_dotenv
 from .logsetup import get_logger
 from .notify import notify
@@ -163,6 +163,16 @@ def collect(store: Store, cfg: Config = CONFIG, scrape_reddit: bool = True,
             print(f"  ! Funding fetch failed: {exc}")
             stats["positioning"] = 0
 
+    if scrape_feeds and cfg.macro.enabled:
+        if verbose:
+            print("\n[1d] Macro (Kalshi event contracts)")
+        try:
+            stats["macro"] = macro.fetch(store, cfg, verbose)
+        except Exception as exc:  # noqa: BLE001 - engine still runs without it
+            _log.exception("macro fetch failed")
+            print(f"  ! Macro fetch failed: {exc}")
+            stats["macro"] = 0
+
     if scan_catalysts:
         if verbose:
             print("\n[2/2] Catalysts (GitHub + news)")
@@ -243,7 +253,7 @@ def run(store: Store, cfg: Config = CONFIG, scrape_reddit: bool = True,
             print(f"  ⟵ {sig['symbol']:<6} {sig['trigger_label']:<16} {sig['reason']}")
 
     print("\n[regime] reading BTC trend...")
-    regime = regime_mod.assess(cfg)
+    regime = regime_mod.assess(cfg, store=store)
     print(f"  {regime_mod.describe(regime)}")
     store.record_regime(run_id, regime)   # so its own effect can be measured later
     _log.info("run %s regime=%s scale=%.2f", run_id, regime.get("state"),
@@ -330,6 +340,8 @@ def status(cfg: Config = CONFIG) -> pd.DataFrame:
          "optional — keyless fallbacks (Arctic Shift, Atom feeds) cover it"),
         ("GitHub token", creds["github"],
          "optional — raises rate limit from 60/hr to 5000/hr"),
+        ("Kalshi API key", creds["kalshi"],
+         "optional — macro regime dampener (Feature 6); no-op without it"),
         ("CRYPTO_YOLO_ALLOW_LIVE", creds["live_trading_env"],
          "second switch required for real orders"),
         ("CRYPTO_YOLO_ALLOW_AUTO_LIVE", creds["auto_live_env"],

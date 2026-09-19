@@ -133,6 +133,46 @@ SCHEDULED_EVENTS: tuple[ScheduledEvent, ...] = (
 
 
 # --------------------------------------------------------------------------
+# Macro event contracts (Feature 6 — Kalshi)
+# --------------------------------------------------------------------------
+# Hand-maintained list of Kalshi SERIES to read as macro signals (see
+# cryptoyolo/macro.py). A Kalshi series is a recurring family of event
+# contracts — e.g. one market per FOMC meeting — so unlike SCHEDULED_EVENTS
+# this does not need a date: `macro.fetch()` always picks the nearest-expiry
+# OPEN market(s) in the series.
+#
+#   label           human-readable, shown in the regime note
+#   series_ticker   Kalshi's series ticker. THESE ARE PLACEHOLDERS, NOT
+#                   VERIFIED TICKERS — Kalshi's catalog changes, and this repo
+#                   has no way to know today's exact strings. Run
+#                   `macro.list_series(query="fed")` (needs working
+#                   credentials) to find the real ones, then edit this tuple.
+#   direction       does a YES resolution favor (+1) or hurt (-1) risk assets
+#                   like crypto? 0 = no inherent direction — any reading far
+#                   from a coin flip is scored as elevated uncertainty
+#                   (bearish), whichever way it points.
+#   weight          relative importance within the blended macro score.
+#
+# Ships EMPTY, same as SCHEDULED_EVENTS — this family contributes nothing to
+# the regime gate until you populate it with real tickers.
+
+@dataclass(frozen=True)
+class MacroSeries:
+    label: str
+    series_ticker: str
+    direction: int = -1
+    weight: float = 1.0
+
+
+MACRO_SERIES: tuple[MacroSeries, ...] = (
+    # e.g. MacroSeries("Fed cuts rates at the next FOMC meeting", "KXFED", +1, 1.0),
+    # e.g. MacroSeries("CPI Y/Y comes in above consensus", "KXCPIYOY", -1, 1.0),
+    # e.g. MacroSeries("Government shutdown in effect", "KXGOVSHUT", -1, 0.6),
+    # e.g. MacroSeries("US enters a recession this year", "KXRECSS", -1, 0.8),
+)
+
+
+# --------------------------------------------------------------------------
 # Chart timeframes -> (lookback, candle interval)
 # --------------------------------------------------------------------------
 # Interval strings are canonical; each price source maps them to its own vocab.
@@ -389,6 +429,20 @@ class RegimeConfig:
     # price is still inside the MA band.
     drawdown_risk_off_pct: float = 25.0
 
+    # ---- Macro backdrop (Kalshi event contracts, see macro.py) -----------
+    # Folds macro.score()'s blended read into this gate the same way the
+    # drawdown override works: it can only ever DAMPEN the deployment scale
+    # the BTC trend already computed, or force risk_off outright when it
+    # crosses macro_risk_off_threshold — it never boosts past what the trend
+    # alone earned. A no-op whenever assess() is called without a `store`,
+    # macro is disabled, MACRO_SERIES is empty, or there is no fresh Kalshi
+    # snapshot — the same graceful-degradation contract as every other input
+    # to this gate.
+    macro_enabled: bool = True
+    macro_risk_off_threshold: float = -0.6   # macro score at/below this forces risk_off
+    macro_downweight: float = 0.5            # max fractional cut to exposure_scale
+    macro_min_multiplier: float = 0.5        # floor for the dampening multiplier
+
 
 @dataclass
 class EventsConfig:
@@ -416,6 +470,39 @@ class EventsConfig:
     unlock_pct_full_weight: float = 5.0
     fetch_unlocks: bool = False
     unlocks_url: str = ""              # optional public JSON feed; failquietly if unset
+
+
+@dataclass
+class MacroConfig:
+    """Feature 6: macro backdrop via Kalshi event-contract prices.
+
+    Kalshi is a CFTC-regulated prediction market: a contract settles at $1 if
+    a YES proposition resolves true, $0 otherwise, so its live price IS a
+    market-implied probability. This pulls a small, hand-maintained set of
+    MACRO series (`config.MACRO_SERIES`) — Fed decisions, CPI prints,
+    government-shutdown risk — the kind of broad macro uncertainty that moves
+    risk assets generally, crypto included, in a way no per-asset signal here
+    can see coming. See `cryptoyolo/macro.py`.
+
+    Requires an authenticated Kalshi API key (RSA key pair) — see
+    .env.example. Fails soft with no credentials: `fetch()` skips, `score()`
+    reports zero series, and `regime.py`'s fold-in is a no-op.
+    """
+    enabled: bool = True
+    base_url: str = "https://api.elections.kalshi.com"
+    api_prefix: str = "/trade-api/v2"
+    request_delay: float = 0.25
+    # Nearest-expiry OPEN markets to average per series. >1 smooths a series
+    # that lists several adjacent contracts (e.g. rate-decision buckets).
+    max_markets_per_series: int = 3
+    # Ignore markets with less than this much lifetime volume — an untraded
+    # market's price is not a meaningful probability, it's just wherever the
+    # order book happened to open.
+    min_volume: int = 1
+    # A snapshot older than this many hours is treated as no-data, not stale
+    # data — the regime gate should not act on a reading from before the last
+    # `macro.fetch()` had a chance to run (e.g. the 8-hourly collector job).
+    stale_after_hours: float = 36.0
 
 
 @dataclass
@@ -792,6 +879,7 @@ class Config:
     positioning: PositioningConfig = field(default_factory=PositioningConfig)
     catalysts: CatalystConfig = field(default_factory=CatalystConfig)
     events: EventsConfig = field(default_factory=EventsConfig)
+    macro: MacroConfig = field(default_factory=MacroConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     fees: FeeConfig = field(default_factory=FeeConfig)
     regime: RegimeConfig = field(default_factory=RegimeConfig)
@@ -822,6 +910,11 @@ ENV_KEYS = {
     "reddit_client_secret": "REDDIT_CLIENT_SECRET",
     "reddit_user_agent": "REDDIT_USER_AGENT",
     "github_token": "GITHUB_TOKEN",
+    "kalshi_key_id": "KALSHI_API_KEY_ID",
+    # Prefer a file path over inline PEM — private key material with embedded
+    # newlines is awkward (and easy to mis-copy) as a single .env line.
+    "kalshi_private_key_path": "KALSHI_PRIVATE_KEY_PATH",
+    "kalshi_private_key": "KALSHI_PRIVATE_KEY",
 }
 
 
@@ -836,6 +929,9 @@ def credential_status() -> dict[str, bool]:
         "binance": bool(get_secret("binance_key") and get_secret("binance_secret")),
         "reddit_oauth": bool(get_secret("reddit_client_id") and get_secret("reddit_client_secret")),
         "github": bool(get_secret("github_token")),
+        "kalshi": bool(get_secret("kalshi_key_id")
+                      and (get_secret("kalshi_private_key_path")
+                           or get_secret("kalshi_private_key"))),
         "live_trading_env": _env_flag("CRYPTO_YOLO_ALLOW_LIVE", False),
         "auto_live_env": _env_flag("CRYPTO_YOLO_ALLOW_AUTO_LIVE", False),
     }

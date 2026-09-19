@@ -198,3 +198,92 @@ def score_chart(scores: pd.DataFrame, template: str = "plotly_white") -> go.Figu
     )
     fig.add_vline(x=0, line=dict(color="#888", width=1))
     return fig
+
+
+# --------------------------------------------------------------------------
+# Feature 6 — macro backdrop (Kalshi)
+# --------------------------------------------------------------------------
+_MACRO_PALETTE = ["#377eb8", "#ff7f00", "#4daf4a", "#984ea3", "#e41a1c", "#a65628"]
+
+
+def macro_chart(detail: pd.DataFrame, template: str = "plotly_white") -> go.Figure:
+    """Current snapshot: one horizontal bar per configured Kalshi series.
+
+    Bar length is the market-implied P(YES); color is the SIGN of that
+    series' contribution to the blended macro score (green = currently reads
+    supportive of the regime gate, red = currently reads as a dampener),
+    which can differ from "high probability = green" whenever `direction` is
+    negative — a high P(shutdown) is red even though 0.9 > 0.1. The dashed
+    line at 50% is a coin flip: the market has no opinion there.
+    """
+    if detail is None or detail.empty:
+        fig = go.Figure()
+        fig.update_layout(
+            template=template, height=200,
+            title=dict(text="<b>Macro backdrop (Kalshi)</b><br>"
+                            "<sub>no data yet — populate config.MACRO_SERIES and "
+                            "run macro.fetch()</sub>", x=0.01, xanchor="left"),
+        )
+        return fig
+
+    df = detail.sort_values("probability")
+    colors = [C_UP if c >= 0 else C_DOWN for c in df["contribution"]]
+    fig = go.Figure(go.Bar(
+        y=df["label"], x=df["probability"], orientation="h",
+        marker_color=colors, text=[f"{p:.0%}" for p in df["probability"]],
+        textposition="outside", cliponaxis=False,
+        customdata=df[["probability", "direction", "weight", "contribution"]].to_numpy(),
+        hovertemplate="<b>%{y}</b><br>P(YES) %{customdata[0]:.0%} · direction "
+                      "%{customdata[1]:+d} · weight %{customdata[2]:.2f}"
+                      "<br>contribution %{customdata[3]:+.3f}<extra></extra>",
+    ))
+    fig.add_vline(x=0.5, line=dict(color="#888", width=1, dash="dot"))
+    fig.update_layout(
+        height=max(220, 56 * len(df) + 120), template=template, showlegend=False,
+        title=dict(text="<b>Macro backdrop — Kalshi market-implied probabilities</b>"
+                        "<br><sub>dashed line = coin flip (50%) · green bars currently "
+                        "support the regime gate, red bars dampen it</sub>",
+                   x=0.01, xanchor="left"),
+        xaxis=dict(title="P(YES)", range=[0, 1.08], tickformat=".0%"),
+        margin=dict(l=10, r=40, t=90, b=40),
+    )
+    return fig
+
+
+def macro_history_chart(history: pd.DataFrame, template: str = "plotly_white") -> go.Figure:
+    """Probability over time, one line per series, from `store.macro_history()`.
+
+    The snapshot bar chart shows where the market stands now; this shows how
+    it got there — a Fed-cut contract climbing from 40% to 75% over a week is
+    a much stronger read than the same 75% with no trend behind it.
+    """
+    fig = go.Figure()
+    if history is None or history.empty:
+        fig.update_layout(
+            template=template, height=200,
+            title=dict(text="<b>Macro backdrop over time</b><br>"
+                            "<sub>no snapshots yet — history accumulates as "
+                            "macro.fetch() runs on each cycle</sub>",
+                       x=0.01, xanchor="left"),
+        )
+        return fig
+
+    for i, (label, sub) in enumerate(history.groupby("label")):
+        sub = sub.sort_values("fetched_at")
+        fig.add_trace(go.Scatter(
+            x=pd.to_datetime(sub["fetched_at"], utc=True, format="ISO8601"),
+            y=sub["probability"], name=str(label), mode="lines+markers",
+            line=dict(color=_MACRO_PALETTE[i % len(_MACRO_PALETTE)], width=1.6),
+            marker=dict(size=4),
+        ))
+    fig.add_hline(y=0.5, line=dict(color="#888", width=1, dash="dot"))
+    fig.update_layout(
+        height=380, template=template,
+        title=dict(text="<b>Macro backdrop over time</b>"
+                        "<br><sub>Kalshi market-implied P(YES) at each fetch</sub>",
+                   x=0.01, xanchor="left"),
+        yaxis=dict(title="P(YES)", range=[0, 1], tickformat=".0%"),
+        margin=dict(l=60, r=30, t=90, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=10)),
+    )
+    return fig

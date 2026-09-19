@@ -13,6 +13,12 @@ chart and returns one of three states plus a deployment multiplier that
 The thresholds live in `RegimeConfig`. This is a blunt instrument on purpose:
 a single, legible, hard-to-overfit switch does more for long-only crypto
 returns than any amount of signal tuning, precisely because it is not tuned.
+
+A second, independent input can dampen (never boost) the BTC-trend verdict:
+`macro.py`'s blended read of Kalshi event-contract prices (Fed decisions, CPI,
+government-shutdown risk, ...). It only ever restricts exposure further, the
+same way the drawdown override does, and is a no-op whenever `assess()` is
+called without a `store` — see `_apply_macro`.
 """
 
 from __future__ import annotations
@@ -22,8 +28,10 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from . import macro as macro_mod
 from . import prices as prices_mod
 from .config import CONFIG, Config
+from .store import Store
 
 
 def _sma(s: pd.Series, n: int) -> pd.Series:
@@ -38,10 +46,65 @@ def _blank(rc, symbol: str, state: str, scale: float, note: str) -> dict[str, An
         "btc_price": None, "btc_ma": None, "ma_days": rc.ma_days,
         "ma_window_used": None, "pct_vs_ma": None, "ma_slope_pct": None,
         "drawdown_from_high_pct": None,
+        "macro_enabled": rc.macro_enabled, "macro_score": None,
+        "macro_note": "", "macro_forced_risk_off": False,
     }
 
 
-def assess(cfg: Config = CONFIG, symbol: str = "BTC") -> dict[str, Any]:
+def _macro_note_suffix(info: dict[str, Any]) -> str:
+    if info.get("macro_forced_risk_off"):
+        return f" | macro override -> risk_off: {info['macro_note']}"
+    if info.get("macro_score") is not None:
+        return f" | macro {info['macro_score']:+.2f}: {info['macro_note']}"
+    return ""
+
+
+def _apply_macro(rc, state: str, scale: float, cfg: Config,
+                 store: Store | None) -> tuple[str, float, dict[str, Any]]:
+    """Fold the Kalshi macro read into a trend-determined (state, scale).
+
+    Folded in AFTER the trend call, the same way the drawdown override works:
+    a supportive macro backdrop can never push exposure past what the trend
+    alone earned, but a bad one can cut it further, or force risk_off outright
+    once it crosses `macro_risk_off_threshold`. Any failure — no store passed,
+    macro disabled, no credentials, no fresh snapshot — degrades to "no
+    adjustment", the same contract every other input to this gate honours.
+    """
+    info: dict[str, Any] = {"macro_enabled": rc.macro_enabled, "macro_score": None,
+                            "macro_note": "", "macro_forced_risk_off": False}
+    if not rc.macro_enabled:
+        info["macro_note"] = "macro gate off (CONFIG.regime.macro_enabled = False)"
+        return state, scale, info
+    if store is None:
+        info["macro_note"] = "no store passed to regime.assess() — macro skipped"
+        return state, scale, info
+
+    try:
+        m = macro_mod.score(store, cfg)
+    except Exception as exc:  # noqa: BLE001 - macro must never crash the regime gate
+        info["macro_note"] = f"macro unavailable ({exc})"
+        return state, scale, info
+
+    if not m.get("n_series"):
+        info["macro_note"] = m.get("note", "macro: no data")
+        return state, scale, info
+
+    score_v = float(m["score"])
+    info.update(macro_score=round(score_v, 4), macro_note=m.get("note", ""))
+
+    if score_v <= rc.macro_risk_off_threshold:
+        info["macro_forced_risk_off"] = True
+        return "risk_off", rc.risk_off_exposure, info
+
+    if score_v < 0:
+        multiplier = max(rc.macro_min_multiplier, 1.0 + score_v * rc.macro_downweight)
+        return state, scale * multiplier, info
+
+    return state, scale, info
+
+
+def assess(cfg: Config = CONFIG, symbol: str = "BTC",
+          store: Store | None = None) -> dict[str, Any]:
     """Classify the current regime from `symbol`'s daily candles.
 
     Returns a dict with `state`, `exposure_scale` (the multiplier for the
@@ -51,22 +114,35 @@ def assess(cfg: Config = CONFIG, symbol: str = "BTC") -> dict[str, Any]:
 
     A dead-band (`ma_band_pct`) around the MA stops the gate flipping every
     cycle while price chops across the line.
+
+    Pass `store` to also fold in the Kalshi macro read (see module docstring
+    and `_apply_macro`); without it macro is silently skipped, exactly like
+    every other optional input here.
     """
     rc = cfg.regime
     if not rc.enabled:
-        return _blank(rc, symbol, "risk_on", 1.0, "regime gate disabled")
+        state, scale, macro_info = _apply_macro(rc, "risk_on", 1.0, cfg, store)
+        return {**_blank(rc, symbol, state, scale,
+                         "regime gate disabled" + _macro_note_suffix(macro_info)),
+               **macro_info}
 
     try:
         df, src = prices_mod.get_ohlcv(symbol, "1y", cfg)
         close = df["close"].astype(float).dropna()
     except Exception as exc:  # noqa: BLE001 - degrade to neutral, never crash
-        return _blank(rc, symbol, "neutral", rc.neutral_exposure,
-                      f"price history unavailable ({exc}); abstaining (neutral)")
+        state, scale, macro_info = _apply_macro(
+            rc, "neutral", rc.neutral_exposure, cfg, store)
+        note = f"price history unavailable ({exc}); abstaining (neutral)"
+        return {**_blank(rc, symbol, state, scale, note + _macro_note_suffix(macro_info)),
+               **macro_info}
 
     if len(close) < rc.min_candles:
-        return _blank(rc, symbol, "neutral", rc.neutral_exposure,
-                      f"only {len(close)} daily candles (< min_candles "
-                      f"{rc.min_candles}); MA unreliable, abstaining (neutral)")
+        state, scale, macro_info = _apply_macro(
+            rc, "neutral", rc.neutral_exposure, cfg, store)
+        note = (f"only {len(close)} daily candles (< min_candles "
+                f"{rc.min_candles}); MA unreliable, abstaining (neutral)")
+        return {**_blank(rc, symbol, state, scale, note + _macro_note_suffix(macro_info)),
+               **macro_info}
 
     # If history is short of ma_days, use what we have and SAY the window is
     # shorter than advertised rather than silently computing a faster MA.
@@ -75,8 +151,11 @@ def assess(cfg: Config = CONFIG, symbol: str = "BTC") -> dict[str, Any]:
     price = float(close.iloc[-1])
     ma = float(ma_series.iloc[-1])
     if not np.isfinite(ma) or ma <= 0:
-        return _blank(rc, symbol, "neutral", rc.neutral_exposure,
-                      "moving average not computable yet; abstaining (neutral)")
+        state, scale, macro_info = _apply_macro(
+            rc, "neutral", rc.neutral_exposure, cfg, store)
+        note = "moving average not computable yet; abstaining (neutral)"
+        return {**_blank(rc, symbol, state, scale, note + _macro_note_suffix(macro_info)),
+               **macro_info}
 
     band = rc.ma_band_pct / 100.0
     upper, lower = ma * (1 + band), ma * (1 - band)
@@ -94,6 +173,8 @@ def assess(cfg: Config = CONFIG, symbol: str = "BTC") -> dict[str, Any]:
     else:
         state, scale = "neutral", rc.neutral_exposure
 
+    state, scale, macro_info = _apply_macro(rc, state, scale, cfg, store)
+
     out = _blank(rc, symbol, state, scale, "")
     out.update(
         source=src, btc_price=round(price, 2), btc_ma=round(ma, 2),
@@ -104,8 +185,10 @@ def assess(cfg: Config = CONFIG, symbol: str = "BTC") -> dict[str, Any]:
         note=(f"{symbol} {pct_vs_ma * 100:+.1f}% vs its "
               f"{win}d MA{' (short history)' if win < rc.ma_days else ''} "
               f"±{rc.ma_band_pct:.0f}% band (MA slope {ma_slope * 100:+.1f}% / "
-              f"{lookback}d, drawdown {dd * 100:.1f}% from trailing high)"),
+              f"{lookback}d, drawdown {dd * 100:.1f}% from trailing high)"
+              + _macro_note_suffix(macro_info)),
     )
+    out.update(macro_info)
     return out
 
 
