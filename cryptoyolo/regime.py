@@ -118,13 +118,16 @@ def assess(cfg: Config = CONFIG, symbol: str = "BTC",
     Pass `store` to also fold in the Kalshi macro read (see module docstring
     and `_apply_macro`); without it macro is silently skipped, exactly like
     every other optional input here.
+
+    `rc.enabled = False` means what `describe()` says it means — full size
+    regardless of trend OR macro. It does NOT fall through to `_apply_macro`:
+    macro is a dampener on the trend verdict this gate produces, and with the
+    gate itself off there is no trend verdict to dampen.
     """
     rc = cfg.regime
     if not rc.enabled:
-        state, scale, macro_info = _apply_macro(rc, "risk_on", 1.0, cfg, store)
-        return {**_blank(rc, symbol, state, scale,
-                         "regime gate disabled" + _macro_note_suffix(macro_info)),
-               **macro_info}
+        return _blank(rc, symbol, "risk_on", 1.0,
+                      "regime gate disabled (full size, macro not consulted)")
 
     try:
         df, src = prices_mod.get_ohlcv(symbol, "1y", cfg)

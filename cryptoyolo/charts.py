@@ -11,7 +11,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from .config import CONFIG, TIMEFRAMES, BandConfig, Config
-from . import indicators, prices
+from . import indicators, macro, prices
 
 # Colorblind-safe, readable on both light and dark templates.
 C_UP, C_DOWN = "#1a9850", "#d73027"
@@ -184,6 +184,7 @@ def score_chart(scores: pd.DataFrame, template: str = "plotly_white") -> go.Figu
         ("w_catalyst", "#4daf4a", "Catalyst"),
         ("w_positioning", "#984ea3", "Positioning"),
         ("w_events", "#e41a1c", "Events"),
+        ("w_kalshi_prediction", "#a65628", "Kalshi prediction"),
     ):
         if col in df:
             fig.add_trace(go.Bar(y=df["symbol"], x=df[col], name=label,
@@ -209,12 +210,11 @@ _MACRO_PALETTE = ["#377eb8", "#ff7f00", "#4daf4a", "#984ea3", "#e41a1c", "#a6562
 def macro_chart(detail: pd.DataFrame, template: str = "plotly_white") -> go.Figure:
     """Current snapshot: one horizontal bar per configured Kalshi series.
 
-    Bar length is the market-implied P(YES); color is the SIGN of that
-    series' contribution to the blended macro score (green = currently reads
-    supportive of the regime gate, red = currently reads as a dampener),
-    which can differ from "high probability = green" whenever `direction` is
-    negative — a high P(shutdown) is red even though 0.9 > 0.1. The dashed
-    line at 50% is a coin flip: the market has no opinion there.
+    Bar length is the market-implied P(YES); the black tick on each bar is
+    that series' `baseline` (its normal level). Red = worse than normal, so
+    currently dampening the regime gate; green = at or better than normal,
+    contributing nothing. Which side of the tick is "worse" depends on
+    `direction` — for a bad event (direction -1) it's above the tick.
     """
     if detail is None or detail.empty:
         fig = go.Figure()
@@ -232,17 +232,23 @@ def macro_chart(detail: pd.DataFrame, template: str = "plotly_white") -> go.Figu
         y=df["label"], x=df["probability"], orientation="h",
         marker_color=colors, text=[f"{p:.0%}" for p in df["probability"]],
         textposition="outside", cliponaxis=False,
-        customdata=df[["probability", "direction", "weight", "contribution"]].to_numpy(),
-        hovertemplate="<b>%{y}</b><br>P(YES) %{customdata[0]:.0%} · direction "
-                      "%{customdata[1]:+d} · weight %{customdata[2]:.2f}"
-                      "<br>contribution %{customdata[3]:+.3f}<extra></extra>",
+        customdata=df[["probability", "direction", "weight", "contribution",
+                       "baseline"]].to_numpy(),
+        hovertemplate="<b>%{y}</b><br>P(YES) %{customdata[0]:.0%} vs normal "
+                      "%{customdata[4]:.0%} · direction %{customdata[1]:+d} · weight "
+                      "%{customdata[2]:.2f}<br>contribution %{customdata[3]:+.3f}"
+                      "<extra></extra>",
     ))
-    fig.add_vline(x=0.5, line=dict(color="#888", width=1, dash="dot"))
+    fig.add_trace(go.Scatter(
+        y=df["label"], x=df["baseline"], mode="markers", name="normal",
+        marker=dict(symbol="line-ns-open", size=22, color="#222", line=dict(width=2)),
+        hovertemplate="normal %{x:.0%}<extra></extra>",
+    ))
     fig.update_layout(
         height=max(220, 56 * len(df) + 120), template=template, showlegend=False,
         title=dict(text="<b>Macro backdrop — Kalshi market-implied probabilities</b>"
-                        "<br><sub>dashed line = coin flip (50%) · green bars currently "
-                        "support the regime gate, red bars dampen it</sub>",
+                        "<br><sub>tick = each series' normal level · red bars are "
+                        "worse than normal and dampen the regime gate</sub>",
                    x=0.01, xanchor="left"),
         xaxis=dict(title="P(YES)", range=[0, 1.08], tickformat=".0%"),
         margin=dict(l=10, r=40, t=90, b=40),
@@ -256,8 +262,13 @@ def macro_history_chart(history: pd.DataFrame, template: str = "plotly_white") -
     The snapshot bar chart shows where the market stands now; this shows how
     it got there — a Fed-cut contract climbing from 40% to 75% over a week is
     a much stronger read than the same 75% with no trend behind it.
+
+    Plots each series' combined probability per fetch (outcomes summed,
+    otherwise averaged — exactly what `macro.score()` fed the regime gate),
+    not the raw per-market rows.
     """
     fig = go.Figure()
+    history = macro.series_history(history)
     if history is None or history.empty:
         fig.update_layout(
             template=template, height=200,
@@ -268,7 +279,8 @@ def macro_history_chart(history: pd.DataFrame, template: str = "plotly_white") -
         )
         return fig
 
-    for i, (label, sub) in enumerate(history.groupby("label")):
+    for i, (_ticker, sub) in enumerate(history.groupby("series_ticker")):
+        label = sub["label"].iloc[-1]
         sub = sub.sort_values("fetched_at")
         fig.add_trace(go.Scatter(
             x=pd.to_datetime(sub["fetched_at"], utc=True, format="ISO8601"),
@@ -276,7 +288,6 @@ def macro_history_chart(history: pd.DataFrame, template: str = "plotly_white") -
             line=dict(color=_MACRO_PALETTE[i % len(_MACRO_PALETTE)], width=1.6),
             marker=dict(size=4),
         ))
-    fig.add_hline(y=0.5, line=dict(color="#888", width=1, dash="dot"))
     fig.update_layout(
         height=380, template=template,
         title=dict(text="<b>Macro backdrop over time</b>"

@@ -19,7 +19,7 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from .broker import execution_banner, is_rejected
+from .broker import execution_banner, is_rejected, is_validate_only
 from .config import CONFIG, Config
 from .engine import fmt_price, fmt_qty
 from .logsetup import get_logger
@@ -258,6 +258,7 @@ def execute_approved(proposals: pd.DataFrame, broker, store: Store, run_id: str,
         _sync_position_meta(p, record, broker, store, cfg)
 
         rejected = is_rejected(record["status"])
+        validated = is_validate_only(record["status"])   # dry run: nothing sent
         is_exit = p.get("kind") == "exit"
         mark = "✗" if rejected else "✓"
         print(f"  {mark} {record['side']:<4} {record['symbol']:<6} "
@@ -271,6 +272,8 @@ def execute_approved(proposals: pd.DataFrame, broker, store: Store, run_id: str,
             notify(f"{record['symbol']} order rejected",
                    f"{record['side']} {record['symbol']} — {record['status']} "
                    f"[{record['mode']}]", cfg, tag="rejected")
+        elif validated:
+            pass    # the ✓ line above already says VALIDATED; no "filled" alert
         elif not rejected and is_exit and cfg.notify.on_exit_trigger:
             notify(f"{record['symbol']} exit filled — {p.get('trigger', 'exit')}",
                    f"sold {record['qty']:g} {record['symbol']} @ "

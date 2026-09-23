@@ -89,7 +89,7 @@ CREATE TABLE IF NOT EXISTS scores (
     ts            TEXT NOT NULL,
     symbol        TEXT NOT NULL,
     technical     REAL, social REAL, catalyst REAL, composite REAL,
-    positioning   REAL, events REAL, xsec REAL,
+    positioning   REAL, events REAL, xsec REAL, kalshi_prediction REAL,
     components    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_scores_run ON scores(run_id);
@@ -267,6 +267,22 @@ CREATE TABLE IF NOT EXISTS macro_markets (
 );
 CREATE INDEX IF NOT EXISTS idx_macro_series ON macro_markets(series_ticker, fetched_at);
 
+-- Kalshi crypto price-market snapshots (Feature 7, kalshi_prediction.py).
+-- One row per (ticker, fetched_at), same append-don't-overwrite shape as
+-- macro_markets, so a strike's probability history is preserved.
+CREATE TABLE IF NOT EXISTS kalshi_price_markets (
+    ticker        TEXT NOT NULL,
+    series_ticker TEXT NOT NULL,
+    symbol        TEXT NOT NULL,       -- universe symbol this strike predicts
+    strike        REAL NOT NULL,       -- the price threshold, e.g. 110000.0
+    probability   REAL NOT NULL,       -- implied P(price > strike), 0..1
+    volume        INTEGER,
+    close_time    TEXT,
+    fetched_at    TEXT NOT NULL,
+    PRIMARY KEY (ticker, fetched_at)
+);
+CREATE INDEX IF NOT EXISTS idx_kalshi_price_symbol ON kalshi_price_markets(symbol, fetched_at);
+
 CREATE TABLE IF NOT EXISTS prices_daily (
     symbol     TEXT NOT NULL,
     date       TEXT NOT NULL,          -- 'YYYY-MM-DD' (UTC)
@@ -338,7 +354,7 @@ class Store:
         # NULL here; `evaluation` falls back to parsing the components JSON for
         # them, so nothing is lost, but new rows get clean columns.
         score_cols = {r["name"] for r in con.execute("PRAGMA table_info(scores)")}
-        for col in ("positioning", "events", "xsec"):
+        for col in ("positioning", "events", "xsec", "kalshi_prediction"):
             if col not in score_cols:
                 con.execute(f"ALTER TABLE scores ADD COLUMN {col} REAL")
 
@@ -487,7 +503,7 @@ class Store:
                 "technical": r.get("technical"), "social": r.get("social"),
                 "catalyst": r.get("catalyst"), "composite": r.get("composite"),
                 "positioning": r.get("positioning"), "events": r.get("events"),
-                "xsec": r.get("xsec"),
+                "xsec": r.get("xsec"), "kalshi_prediction": r.get("kalshi_prediction"),
                 "components": json.dumps(r.get("components", {}), default=str),
             }
             for r in rows
@@ -495,9 +511,11 @@ class Store:
         with self.conn() as con:
             con.executemany(
                 """INSERT INTO scores(run_id, ts, symbol, technical, social,
-                        catalyst, composite, positioning, events, xsec, components)
+                        catalyst, composite, positioning, events, xsec,
+                        kalshi_prediction, components)
                    VALUES (:run_id,:ts,:symbol,:technical,:social,:catalyst,
-                           :composite,:positioning,:events,:xsec,:components)""",
+                           :composite,:positioning,:events,:xsec,
+                           :kalshi_prediction,:components)""",
                 payload,
             )
 
@@ -555,7 +573,8 @@ class Store:
     def scores_history(self, since: datetime | None = None) -> pd.DataFrame:
         """Every stored score row, for the evaluation module. Newest last."""
         q = ("SELECT run_id, ts, symbol, technical, social, catalyst, "
-             "positioning, events, xsec, composite, components FROM scores")
+             "positioning, events, xsec, kalshi_prediction, composite, "
+             "components FROM scores")
         params: tuple = ()
         if since is not None:
             q += " WHERE ts >= ?"
@@ -590,6 +609,13 @@ class Store:
                  regime.get("ma_slope_pct"), regime.get("drawdown_from_high_pct"),
                  regime.get("note")),
             )
+
+    def last_regime_state(self) -> str | None:
+        """The state recorded by the most recent cycle, or None if none yet."""
+        with self.conn() as con:
+            row = con.execute(
+                "SELECT state FROM regime_log ORDER BY ts DESC LIMIT 1").fetchone()
+        return row[0] if row else None
 
     def regime_history(self) -> pd.DataFrame:
         with self.conn() as con:
@@ -734,6 +760,48 @@ class Store:
         if series_ticker:
             q += " WHERE series_ticker = ?"
             params = (series_ticker,)
+        with self.conn() as con:
+            return pd.read_sql_query(q + " ORDER BY fetched_at ASC", con, params=params)
+
+    # -- kalshi_prediction (Kalshi crypto price markets) ---------------------
+    def upsert_kalshi_prediction(self, rows: Iterable[dict[str, Any]]) -> int:
+        rows = list(rows)
+        if not rows:
+            return 0
+        with self.conn() as con:
+            cur = con.executemany(
+                """INSERT INTO kalshi_price_markets
+                   (ticker, series_ticker, symbol, strike, probability, volume,
+                    close_time, fetched_at)
+                   VALUES (:ticker,:series_ticker,:symbol,:strike,:probability,
+                           :volume,:close_time,:fetched_at)
+                   ON CONFLICT(ticker, fetched_at) DO UPDATE SET
+                     probability=excluded.probability, volume=excluded.volume""",
+                rows,
+            )
+            return cur.rowcount
+
+    def kalshi_prediction_latest(self, since: datetime | None = None) -> pd.DataFrame:
+        """The most recent stored row per ticker, optionally dropping any
+        ticker whose latest row is older than `since` (stale = no-data, not
+        "use an old number") — same contract as `macro_latest`."""
+        q = """SELECT k.* FROM kalshi_price_markets k
+               JOIN (SELECT ticker, MAX(fetched_at) AS mx FROM kalshi_price_markets
+                     GROUP BY ticker) t
+                 ON k.ticker = t.ticker AND k.fetched_at = t.mx"""
+        params: tuple = ()
+        if since is not None:
+            q += " WHERE k.fetched_at >= ?"
+            params = (since.isoformat(),)
+        with self.conn() as con:
+            return pd.read_sql_query(q, con, params=params)
+
+    def kalshi_prediction_history(self, symbol: str | None = None) -> pd.DataFrame:
+        q = "SELECT * FROM kalshi_price_markets"
+        params: tuple = ()
+        if symbol:
+            q += " WHERE symbol = ?"
+            params = (symbol,)
         with self.conn() as con:
             return pd.read_sql_query(q + " ORDER BY fetched_at ASC", con, params=params)
 
@@ -899,8 +967,15 @@ class Store:
 
     # -- point-in-time daily prices --------------------------------------
     def upsert_daily_prices(self, rows: Iterable[dict[str, Any]]) -> int:
-        """Insert/update daily close rows. Keys: symbol, date, close, source,
-        fetched_at."""
+        """Insert daily close rows. Keys: symbol, date, close, source,
+        fetched_at.
+
+        Point-in-time: once a date's close was recorded AFTER that UTC day
+        ended, it is final and never overwritten — a later cycle falling back
+        to a different price source must not rewrite history evaluation has
+        already scored against. Only a provisional row (fetched on or before
+        its own date, i.e. from a still-forming candle) is replaced.
+        """
         rows = list(rows)
         if not rows:
             return 0
@@ -910,7 +985,8 @@ class Store:
                    VALUES (:symbol,:date,:close,:source,:fetched_at)
                    ON CONFLICT(symbol, date) DO UPDATE SET
                      close=excluded.close, source=excluded.source,
-                     fetched_at=excluded.fetched_at""",
+                     fetched_at=excluded.fetched_at
+                   WHERE substr(prices_daily.fetched_at, 1, 10) <= prices_daily.date""",
                 rows,
             )
             return cur.rowcount
@@ -923,6 +999,10 @@ class Store:
         1:1 while an intraday one still collapses cleanly. This is the single
         writer used by both `engine.build_scores` (every cycle) and the one-off
         `backfill_prices.py`.
+
+        Today's (UTC) date is skipped: its candle is still forming, so its
+        "close" is just the price at fetch time. It gets stored on the first
+        cycle after midnight UTC, once it's final.
         """
         s = pd.Series(close).dropna()
         if s.empty:
@@ -930,6 +1010,7 @@ class Store:
         idx = pd.DatetimeIndex(pd.to_datetime(s.index, utc=True))
         s = pd.Series(s.to_numpy(dtype=float), index=idx).sort_index()
         daily = s.groupby(s.index.strftime("%Y-%m-%d")).last()
+        daily = daily[daily.index < utcnow().strftime("%Y-%m-%d")]
         fetched = iso()
         rows = [{"symbol": symbol, "date": str(d), "close": float(v),
                  "source": source or None, "fetched_at": fetched}

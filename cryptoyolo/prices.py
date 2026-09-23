@@ -31,7 +31,7 @@ OHLCV_COLS = ["open", "high", "low", "close", "volume"]
 INTERVAL_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}
 
 _session: requests.Session | None = None
-_cache: dict[tuple, tuple[float, pd.DataFrame]] = {}
+_cache: dict[tuple, tuple[float, pd.DataFrame, str]] = {}   # key -> (ts, df, source)
 
 
 def session(cfg: Config = CONFIG) -> requests.Session:
@@ -224,7 +224,9 @@ def get_ohlcv(symbol: str, timeframe: str = "1w", cfg: Config = CONFIG,
     """Fetch candles for one asset/timeframe. Returns (df, source_used).
 
     Sources are tried in `cfg.price_source_order`; the first that returns a
-    usable frame wins. Raises only if every source fails.
+    usable frame wins. Raises only if every source fails. A cache hit
+    reports the source that originally produced the frame, never "cache" —
+    callers record it (prices_daily.source) and alert on fallbacks by it.
     """
     from .config import TIMEFRAMES
 
@@ -234,16 +236,16 @@ def get_ohlcv(symbol: str, timeframe: str = "1w", cfg: Config = CONFIG,
 
     key = (symbol, timeframe, cfg.execution.venue)
     if use_cache and key in _cache:
-        ts, cached = _cache[key]
+        ts, cached, cached_source = _cache[key]
         if time.time() - ts < cfg.cache_ttl_seconds:
-            return cached.copy(), "cache"
+            return cached.copy(), cached_source
 
     errors: list[str] = []
     for source in cfg.price_source_order:
         try:
             df = FETCHERS[source](symbol, interval, start, cfg)
             if df is not None and len(df) >= 5:
-                _cache[key] = (time.time(), df.copy())
+                _cache[key] = (time.time(), df.copy(), source)
                 return df, source
             errors.append(f"{source}: only {0 if df is None else len(df)} candles")
         except Exception as exc:  # noqa: BLE001 - fall through to next source

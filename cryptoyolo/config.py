@@ -138,23 +138,34 @@ SCHEDULED_EVENTS: tuple[ScheduledEvent, ...] = (
 # Hand-maintained list of Kalshi SERIES to read as macro signals (see
 # cryptoyolo/macro.py). A Kalshi series is a recurring family of event
 # contracts — e.g. one market per FOMC meeting — so unlike SCHEDULED_EVENTS
-# this does not need a date: `macro.fetch()` always picks the nearest-expiry
-# OPEN market(s) in the series.
+# this does not need a date: `macro.fetch()` always picks the soonest-closing
+# OPEN event in the series (the next meeting, the next print).
 #
 #   label           human-readable, shown in the regime note
-#   series_ticker   Kalshi's series ticker. THESE ARE PLACEHOLDERS, NOT
-#                   VERIFIED TICKERS — Kalshi's catalog changes, and this repo
-#                   has no way to know today's exact strings. Run
-#                   `macro.list_series(query="fed")` (needs working
-#                   credentials) to find the real ones, then edit this tuple.
+#   series_ticker   Kalshi's series ticker. Verified against the live API on
+#                   2026-09-22, but Kalshi's catalog changes — re-check with
+#                   `macro.list_series(query="fed")` if a series stops
+#                   returning open markets.
 #   direction       does a YES resolution favor (+1) or hurt (-1) risk assets
-#                   like crypto? 0 = no inherent direction — any reading far
-#                   from a coin flip is scored as elevated uncertainty
+#                   like crypto? 0 = no inherent direction — any move away
+#                   from `baseline` is scored as elevated uncertainty
 #                   (bearish), whichever way it points.
 #   weight          relative importance within the blended macro score.
+#   baseline        the P(YES) that counts as NORMAL for this event — the
+#                   reference each reading is scored against (not 50%). Only
+#                   readings worse than baseline dampen the gate; certainty of
+#                   the bad outcome costs the full weight. Default 0.5 suits a
+#                   genuine coin-flip proposition only.
+#   outcomes        market-ticker suffixes to read within the nearest event,
+#                   for series that list several markets per event. Their
+#                   probabilities are SUMMED, so they must be mutually
+#                   exclusive: e.g. ("H25", "H26") on KXFEDDECISION = P(any
+#                   hike), or a single strike ("T0.3",) on a threshold ladder
+#                   like KXCPICORE. Empty = one yes/no market per event
+#                   (averaged if there are several).
 #
-# Ships EMPTY, same as SCHEDULED_EVENTS — this family contributes nothing to
-# the regime gate until you populate it with real tickers.
+# The directions, weights, strikes and baselines below are judgement calls,
+# not fitted coefficients — argue with them.
 
 @dataclass(frozen=True)
 class MacroSeries:
@@ -162,13 +173,68 @@ class MacroSeries:
     series_ticker: str
     direction: int = -1
     weight: float = 1.0
+    outcomes: tuple[str, ...] = ()
+    baseline: float = 0.5
+
+    def __post_init__(self):
+        if not 0.0 < self.baseline < 1.0:
+            raise ValueError(f"MacroSeries {self.series_ticker}: baseline must be "
+                             f"strictly between 0 and 1, got {self.baseline}")
 
 
 MACRO_SERIES: tuple[MacroSeries, ...] = (
-    # e.g. MacroSeries("Fed cuts rates at the next FOMC meeting", "KXFED", +1, 1.0),
-    # e.g. MacroSeries("CPI Y/Y comes in above consensus", "KXCPIYOY", -1, 1.0),
-    # e.g. MacroSeries("Government shutdown in effect", "KXGOVSHUT", -1, 0.6),
-    # e.g. MacroSeries("US enters a recession this year", "KXRECSS", -1, 0.8),
+    # Categorical per-meeting event: H0 hold, H25/H26 hike 25/>25bp,
+    # C25/C26 cut 25/>25bp. KXFED (the rate-level ladder) carries the same
+    # information in a less direct shape.
+    # Baseline ~15%: most meetings are holds or cuts; a hike is the exception.
+    MacroSeries("Fed hikes at the next FOMC meeting", "KXFEDDECISION", -1, 1.0,
+                outcomes=("H25", "H26"), baseline=0.15),
+    # Monthly core-CPI m/m ladder; >0.3% m/m (~3.7%+ annualised) is a hot print.
+    # Baseline ~20%: hot prints happen, but roughly one month in five.
+    MacroSeries("Core CPI m/m prints above 0.3%", "KXCPICORE", -1, 0.8,
+                outcomes=("T0.3",), baseline=0.20),
+    # One yes/no market per calendar year; the nearest is the current year.
+    # Baseline ~15%: roughly the long-run odds of a recession starting in any
+    # given year.
+    MacroSeries("US recession starts this year (NBER)", "KXRECSSNBER", -1, 0.8,
+                baseline=0.15),
+    # No open markets as of 2026-09-22 — Kalshi lists them around funding
+    # deadlines; contributes nothing until then.
+    # Baseline ~25%: markets only list near funding deadlines, when some
+    # shutdown risk is the norm.
+    MacroSeries("Government shutdown", "KXGOVSHUT", -1, 0.6, baseline=0.25),
+)
+
+
+# --------------------------------------------------------------------------
+# Kalshi crypto price markets (Feature 7)
+# --------------------------------------------------------------------------
+# Hand-maintained mapping of universe SYMBOL -> the Kalshi series that lists
+# that asset's own "will price be above $X" markets (see
+# cryptoyolo/kalshi_prediction.py). Distinct from MACRO_SERIES above, which
+# reads Kalshi's MACRO event contracts (Fed, CPI, ...) to dampen the regime
+# gate -- this reads Kalshi's CRYPTO-specific markets and turns them into a
+# per-asset directional score in the composite, the same way positioning or
+# events do.
+#
+#   symbol          a symbol in UNIVERSE this series predicts, e.g. "BTC".
+#   series_ticker   Kalshi's series ticker. THESE ARE PLACEHOLDERS, NOT
+#                   VERIFIED TICKERS, Kalshi's catalog changes -- run
+#                   `kalshi_prediction.list_series(query="bitcoin")` (needs
+#                   working credentials) to find the real ones.
+#
+# Ships EMPTY, same as SCHEDULED_EVENTS -- this family scores
+# 0.0 for every asset until populated with real tickers.
+
+@dataclass(frozen=True)
+class KalshiCryptoSeries:
+    symbol: str
+    series_ticker: str
+
+
+KALSHI_CRYPTO_SERIES: tuple[KalshiCryptoSeries, ...] = (
+    # e.g. KalshiCryptoSeries("BTC", "KXBTCD"),
+    # e.g. KalshiCryptoSeries("ETH", "KXETHD"),
 )
 
 
@@ -227,6 +293,15 @@ class ScoreWeights:
     # contribution. Raise this (0.15 is a sensible start) once you populate the
     # schedule. See calendar_events.py.
     events: float = 0.0
+    # Feature 7: per-asset directional read from Kalshi's own crypto price
+    # markets (config.KALSHI_CRYPTO_SERIES) -- see kalshi_prediction.py.
+    # Defaults to 0.0 for the same reason `events` does: KALSHI_CRYPTO_SERIES
+    # ships EMPTY, and a non-zero weight on an all-zero family only dilutes
+    # every other family's real contribution. Raise it (0.10-0.15 is a
+    # reasonable start) once you populate the series list -- and keep it
+    # modest even then: these markets are short-dated (same-day/week) versus
+    # the 1-30 day horizon the rest of this book trades on.
+    kalshi_prediction: float = 0.0
     # Cross-sectional momentum is NOT a family — it is a blend coefficient that
     # folds an asset's trailing-return rank *relative to the universe* into its
     # technical score. `technical_final = (1 - b) * technical + b * xsec_z`.
@@ -237,14 +312,15 @@ class ScoreWeights:
 
     def normalized(self) -> "ScoreWeights":
         fam = (self.technical, self.social, self.catalyst,
-               self.positioning, self.events)
+               self.positioning, self.events, self.kalshi_prediction)
         total = sum(fam)
         if total <= 0:
-            return ScoreWeights(0.2, 0.2, 0.2, 0.2, 0.2,
+            return ScoreWeights(1 / 6, 1 / 6, 1 / 6, 1 / 6, 1 / 6, 1 / 6,
                                 xsec_momentum_blend=self.xsec_momentum_blend)
         return ScoreWeights(
             self.technical / total, self.social / total, self.catalyst / total,
             self.positioning / total, self.events / total,
+            self.kalshi_prediction / total,
             xsec_momentum_blend=self.xsec_momentum_blend,
         )
 
@@ -440,7 +516,7 @@ class RegimeConfig:
     # to this gate.
     macro_enabled: bool = True
     macro_risk_off_threshold: float = -0.6   # macro score at/below this forces risk_off
-    macro_downweight: float = 0.5            # max fractional cut to exposure_scale
+    macro_downweight: float = 1.0            # exposure_scale x (1 + score * this), floored below
     macro_min_multiplier: float = 0.5        # floor for the dampening multiplier
 
 
@@ -492,8 +568,8 @@ class MacroConfig:
     base_url: str = "https://api.elections.kalshi.com"
     api_prefix: str = "/trade-api/v2"
     request_delay: float = 0.25
-    # Nearest-expiry OPEN markets to average per series. >1 smooths a series
-    # that lists several adjacent contracts (e.g. rate-decision buckets).
+    # For a series without `outcomes`: how many of the nearest event's
+    # markets to average (a plain yes/no series has just one).
     max_markets_per_series: int = 3
     # Ignore markets with less than this much lifetime volume — an untraded
     # market's price is not a meaningful probability, it's just wherever the
@@ -503,6 +579,48 @@ class MacroConfig:
     # data — the regime gate should not act on a reading from before the last
     # `macro.fetch()` had a chance to run (e.g. the 8-hourly collector job).
     stale_after_hours: float = 36.0
+
+
+@dataclass
+class KalshiPredictionConfig:
+    """Feature 7: per-asset directional signal from Kalshi's own crypto price
+    markets — distinct from `MacroConfig` above, which reads Kalshi's MACRO
+    event contracts to dampen the regime gate.
+
+    A Kalshi crypto series (`config.KALSHI_CRYPTO_SERIES`) lists a ladder of
+    "will price be above $X at close" markets sharing one expiration. Given
+    that ladder's (strike, P(YES)) pairs, interpolating at the CURRENT spot
+    price gives the market's own estimate of P(price ends above where it is
+    right now) — a directional read priced by people with money on the line,
+    genuinely independent of this book's own technical/social/catalyst
+    inputs. No hand-set `direction` prior is needed here, unlike
+    `MacroSeries`: "YES" always and only means "price ends higher", so the
+    probability itself IS the signal.
+
+    Two honest caveats, matching macro.py's:
+
+      Short-dated. These markets are typically same-day or same-week
+      expiries, while this book generally holds 1-30 days
+      (`exits.horizon_days`). Treat it as a near-term tilt, not a horizon
+      match — hence `ScoreWeights.kalshi_prediction` defaulting low.
+
+      Only "above/below a single strike" markets are read. Kalshi also lists
+      "between $X and $Y" range buckets on some series; those aren't a
+      straightforward (strike, P(YES>strike)) point and are skipped rather
+      than mis-modelled — see `kalshi_prediction._strike`.
+
+    Requires the same Kalshi API key as `MacroConfig` (RSA key pair) — see
+    .env.example. Fails soft with no credentials, no configured series, or
+    fewer than 2 open strikes to interpolate: the family scores 0.0.
+    """
+    enabled: bool = True
+    request_delay: float = 0.25
+    # Same reasoning as MacroConfig.min_volume: an untraded strike's price is
+    # not a meaningful probability.
+    min_volume: int = 1
+    # Short-dated markets go stale fast — much sooner than macro's 36h, since
+    # a same-day contract's remaining life can be measured in hours.
+    stale_after_hours: float = 6.0
 
 
 @dataclass
@@ -862,7 +980,7 @@ class NotifyConfig:
     on_regime_risk_off: bool = True     # the BTC-trend gate flipped to risk_off
     on_price_fallback: bool = True      # scoring fell through to the yfinance backstop
     on_drawdown: bool = True
-    drawdown_alert_pct: float = 10.0    # alert when equity is this far below its own peak
+    drawdown_alert_pct: float = 10.0    # alert when equity FIRST falls this far below its own peak
 
 
 @dataclass
@@ -880,6 +998,7 @@ class Config:
     catalysts: CatalystConfig = field(default_factory=CatalystConfig)
     events: EventsConfig = field(default_factory=EventsConfig)
     macro: MacroConfig = field(default_factory=MacroConfig)
+    kalshi_prediction: KalshiPredictionConfig = field(default_factory=KalshiPredictionConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     fees: FeeConfig = field(default_factory=FeeConfig)
     regime: RegimeConfig = field(default_factory=RegimeConfig)
@@ -923,15 +1042,25 @@ def get_secret(name: str) -> str | None:
     return os.environ.get(ENV_KEYS.get(name, name)) or None
 
 
+def _kalshi_configured() -> bool:
+    """True only if the key ID is set AND a private key actually loads — a
+    set-but-unreadable key must not show as configured."""
+    if not get_secret("kalshi_key_id"):
+        return False
+    from .macro import KalshiClient     # lazy: macro imports this module
+    try:
+        return KalshiClient().configured
+    except Exception:  # noqa: BLE001 - a status check must never raise
+        return False
+
+
 def credential_status() -> dict[str, bool]:
     """Which integrations are configured. Never returns the values themselves."""
     return {
         "binance": bool(get_secret("binance_key") and get_secret("binance_secret")),
         "reddit_oauth": bool(get_secret("reddit_client_id") and get_secret("reddit_client_secret")),
         "github": bool(get_secret("github_token")),
-        "kalshi": bool(get_secret("kalshi_key_id")
-                      and (get_secret("kalshi_private_key_path")
-                           or get_secret("kalshi_private_key"))),
+        "kalshi": _kalshi_configured(),
         "live_trading_env": _env_flag("CRYPTO_YOLO_ALLOW_LIVE", False),
         "auto_live_env": _env_flag("CRYPTO_YOLO_ALLOW_AUTO_LIVE", False),
     }

@@ -32,6 +32,7 @@ import pandas as pd
 
 from . import catalysts as catalysts_mod
 from . import indicators, prices
+from . import kalshi_prediction as kalshi_prediction_mod
 from . import positioning as positioning_mod
 from . import social as social_mod
 from .config import CONFIG, Config
@@ -149,18 +150,25 @@ def _xsec_momentum(rows: list[dict[str, Any]]) -> dict[str, float]:
 
 def build_scores(store: Store, cfg: Config = CONFIG, verbose: bool = True,
                  extra_symbols: list[str] | None = None) -> pd.DataFrame:
-    """Compute technical/social/catalyst/positioning/events/composite scores.
+    """Compute technical/social/catalyst/positioning/events/kalshi_prediction/
+    composite scores.
 
     `extra_symbols` covers assets you hold that are not in the configured
     universe. Without it those positions are never scored, so no exit signal can
     ever be produced for them - they would be silently unsellable by the engine.
 
-    Two structural notes:
+    Three structural notes:
       * the composite is assembled AFTER the per-asset loop, because the
         technical score is blended with a cross-sectional momentum rank that
         needs every asset scored first;
       * `events` is a fifth family (scheduled dated catalysts) added the same
-        way `positioning` was - it makes room without rescaling the others.
+        way `positioning` was - it makes room without rescaling the others;
+      * `kalshi_prediction` (Feature 7) is a sixth family added the same way,
+        but unlike the others it is scored INSIDE the per-symbol loop, not
+        pre-computed into a DataFrame beforehand - it needs each asset's spot
+        price to interpolate against, and that price is what the loop just
+        fetched. Only the strike ladder itself (`latest_ladder`, a single
+        store read, no network) is fetched ahead of the loop.
     """
     social_df = social_mod.score_symbols(store, cfg).set_index("symbol")
     catalyst_df = catalysts_mod.score_symbols(store, cfg).set_index("symbol")
@@ -172,6 +180,12 @@ def build_scores(store: Store, cfg: Config = CONFIG, verbose: bool = True,
         if verbose:
             print(f"  events family unavailable ({exc})")
         events_df = pd.DataFrame().set_index(pd.Index([], name="symbol"))
+    try:
+        kalshi_ladder = kalshi_prediction_mod.latest_ladder(store, cfg)
+    except Exception as exc:  # noqa: BLE001 - kalshi_prediction is optional; never fatal
+        if verbose:
+            print(f"  kalshi_prediction family unavailable ({exc})")
+        kalshi_ladder = pd.DataFrame()
     weights = cfg.weights.normalized()
     blend = max(0.0, min(1.0, cfg.weights.xsec_momentum_blend))
 
@@ -211,6 +225,11 @@ def build_scores(store: Store, cfg: Config = CONFIG, verbose: bool = True,
         cat = float(catalyst_df.loc[symbol, "catalyst"]) if symbol in catalyst_df.index else 0.0
         pos = float(pos_df.loc[symbol, "positioning"]) if symbol in pos_df.index else 0.0
         evt = float(events_df.loc[symbol, "events"]) if symbol in events_df.index else 0.0
+        # Scored here, not pre-fetched into a DataFrame like the families
+        # above: it needs THIS symbol's just-fetched spot price to interpolate
+        # its Kalshi strike ladder against (see build_scores' docstring).
+        kp = kalshi_prediction_mod.score_one(symbol, medium.get("close"), kalshi_ladder, cfg)
+        kal = float(kp.get("kalshi_prediction", 0.0))
 
         components = {
             "technical_parts": tech_parts,
@@ -218,6 +237,7 @@ def build_scores(store: Store, cfg: Config = CONFIG, verbose: bool = True,
             "catalyst": catalyst_df.loc[symbol].to_dict() if symbol in catalyst_df.index else {},
             "positioning": pos_df.loc[symbol].to_dict() if symbol in pos_df.index else {},
             "events": events_df.loc[symbol].to_dict() if symbol in events_df.index else {},
+            "kalshi_prediction": kp,
             "snapshot_1d": short,
             "snapshot_1w": medium,
             "snapshot_daily": daily,
@@ -231,6 +251,7 @@ def build_scores(store: Store, cfg: Config = CONFIG, verbose: bool = True,
             "catalyst": round(cat, 4),
             "positioning": round(pos, 4),
             "events": round(evt, 4),
+            "kalshi_prediction": round(kal, 4),
             "price": round(medium["close"], 6),
             "atr_pct_1w": round(medium.get("atr_pct", 0.0), 5),
             "atr_pct_daily": round(daily.get("atr_pct", medium.get("atr_pct", 0.02)), 5),
@@ -253,7 +274,8 @@ def build_scores(store: Store, cfg: Config = CONFIG, verbose: bool = True,
         composite = (weights.technical * tech + weights.social * r["social"]
                      + weights.catalyst * r["catalyst"]
                      + weights.positioning * r["positioning"]
-                     + weights.events * r["events"])
+                     + weights.events * r["events"]
+                     + weights.kalshi_prediction * r["kalshi_prediction"])
         r["xsec"] = round(xz, 4)
         r["technical"] = round(tech, 4)
         r["composite"] = round(composite, 4)
@@ -262,6 +284,7 @@ def build_scores(store: Store, cfg: Config = CONFIG, verbose: bool = True,
         r["w_catalyst"] = round(weights.catalyst * r["catalyst"], 4)
         r["w_positioning"] = round(weights.positioning * r["positioning"], 4)
         r["w_events"] = round(weights.events * r["events"], 4)
+        r["w_kalshi_prediction"] = round(weights.kalshi_prediction * r["kalshi_prediction"], 4)
         r["components"]["xsec_momentum"] = xz
 
     df = pd.DataFrame(rows).sort_values("composite", ascending=False).reset_index(drop=True)
@@ -287,7 +310,8 @@ def _rationale(row: pd.Series, side: str, cfg: Config) -> str:
         [("technical", row["w_technical"]), ("social", row["w_social"]),
          ("catalyst", row["w_catalyst"]),
          ("positioning", row.get("w_positioning", 0.0)),
-         ("events", row.get("w_events", 0.0))],
+         ("events", row.get("w_events", 0.0)),
+         ("kalshi_prediction", row.get("w_kalshi_prediction", 0.0))],
         key=lambda kv: abs(kv[1]), reverse=True,
     )
     lead, lead_val = drivers[0]
@@ -339,6 +363,13 @@ def _rationale(row: pd.Series, side: str, cfg: Config) -> str:
             f"(magnitude {ev.get('magnitude', 0):.2f}) — events score {row.get('events', 0):+.2f}."
         )
 
+    kp = c.get("kalshi_prediction", {})
+    if kp and kp.get("n_strikes"):
+        bits.append(
+            f"Kalshi: implied P(up) {kp.get('implied_p_up', 0) * 100:.0f}% across "
+            f"{kp.get('n_strikes', 0)} open strike(s) — {kp.get('note', '')}."
+        )
+
     if side == "SELL":
         bits.append("Bearish score on an existing holding — proposed as an exit, not a short.")
     return " ".join(bits)
@@ -386,10 +417,13 @@ def propose(scores: pd.DataFrame, store: Store, run_id: str, cfg: Config = CONFI
     holdings = holdings or {}
 
     # Risk basis: live equity if we have it and the flag is on, else the static
-    # configured figure. Never zero — an unreadable balance falls back, it does
-    # not disable sizing.
+    # configured figure. `is not None`, not truthy — a genuinely wiped-out
+    # $0.00 account is a real basis (sizing correctly proposes nothing), not
+    # the same thing as "couldn't be read", which is what should fall back.
+    # The >= 0 guard is defensive: equity can't legitimately go negative here,
+    # so a negative value is treated as untrustworthy rather than sized off.
     risk_equity = risk.account_equity_usd
-    if risk.size_off_live_equity and equity_override and equity_override > 0:
+    if risk.size_off_live_equity and equity_override is not None and equity_override >= 0:
         risk_equity = float(equity_override)
 
     # Regime gate.
@@ -690,6 +724,7 @@ def propose(scores: pd.DataFrame, store: Store, run_id: str, cfg: Config = CONFI
                            "catalyst": row["catalyst"],
                            "positioning": row.get("positioning"),
                            "events": row.get("events"),
+                           "kalshi_prediction": row.get("kalshi_prediction"),
                            "composite": row["composite"]},
                 "weights": cfg.weights.normalized().__dict__,
                 "sizing": {"risk_equity": round(risk_equity, 2),

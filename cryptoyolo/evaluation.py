@@ -44,7 +44,8 @@ from . import prices as prices_mod
 from .config import CONFIG, Config, ScoreWeights
 from .store import Store
 
-FAMILIES = ("technical", "social", "catalyst", "positioning", "events", "composite")
+FAMILIES = ("technical", "social", "catalyst", "positioning", "events",
+           "kalshi_prediction", "composite")
 
 
 # --------------------------------------------------------------------------
@@ -89,8 +90,13 @@ def price_series(symbol: str, cfg: Config = CONFIG, timeframe: str = "1y",
     enough history — that path is deterministic and needs no network. Otherwise
     it fetches from the live price sources and, if a store was supplied,
     persists what it got so the next call is served locally.
+
+    Cached on (symbol, timeframe, db path) — keyed by the store's OWN identity,
+    not just whether one was passed, so two Store instances pointing at
+    different databases (e.g. an interactive session switched to a different
+    db_path) never alias each other's cached series.
     """
-    key = (symbol, timeframe, store is not None)
+    key = (symbol, timeframe, str(store.db_path) if store is not None else None)
     if key in _PX_CACHE:
         return _PX_CACHE[key]
 
@@ -151,8 +157,8 @@ def forward_returns(store: Store, cfg: Config = CONFIG,
     """One row per stored score, with the realised forward return beside it.
 
     Columns: run_id, ts, symbol, <each family>, fwd_1d / fwd_7d / fwd_30d.
-    Old rows that predate the positioning/events columns have those families
-    backfilled from the components JSON where possible.
+    Old rows that predate the positioning/events/kalshi_prediction columns
+    have those families backfilled from the components JSON where possible.
 
     `refresh` (default True) drops the price cache first: in a long-lived
     notebook kernel it would otherwise be stale by days after more cycles run.
@@ -165,7 +171,7 @@ def forward_returns(store: Store, cfg: Config = CONFIG,
 
     # Parse each row's components JSON once, then read whatever families the
     # dedicated columns don't already carry.
-    backfill = ("positioning", "events", "xsec")
+    backfill = ("positioning", "events", "kalshi_prediction", "xsec")
     if any(sc[f].isna().any() for f in backfill if f in sc.columns):
         parsed = sc["components"].apply(
             lambda c: json.loads(c) if isinstance(c, str) and c else {})
@@ -613,13 +619,15 @@ def recommend_weights(fr: pd.DataFrame, horizon: int = 7,
         technical=norm.get("technical", 0.0), social=norm.get("social", 0.0),
         catalyst=norm.get("catalyst", 0.0), positioning=norm.get("positioning", 0.0),
         events=norm.get("events", 0.0),
+        kalshi_prediction=norm.get("kalshi_prediction", 0.0),
     )
     return {
         "horizon_d": horizon, "ic_table": ic, "normalised": norm,
         "suggested": suggested, "blend_verdict": blend_verdict,
         "code": (f"CONFIG.weights = ScoreWeights(technical={norm.get('technical',0.0)}, "
                  f"social={norm.get('social',0.0)}, catalyst={norm.get('catalyst',0.0)}, "
-                 f"positioning={norm.get('positioning',0.0)}, events={norm.get('events',0.0)})"),
+                 f"positioning={norm.get('positioning',0.0)}, events={norm.get('events',0.0)}, "
+                 f"kalshi_prediction={norm.get('kalshi_prediction',0.0)})"),
     }
 
 

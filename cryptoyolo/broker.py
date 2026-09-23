@@ -58,6 +58,16 @@ def is_rejected(status: str | None) -> bool:
     return (status or "") in REJECTED_STATES
 
 
+# Accepted by the exchange's validate-only (/order/test) endpoint: nothing was
+# sent, so nothing filled. Not a rejection, but not an execution either —
+# alerts and the cycle summary must not report it as "filled".
+VALIDATE_ONLY_STATES: frozenset[str] = frozenset({"VALIDATED"})
+
+
+def is_validate_only(status: str | None) -> bool:
+    return (status or "") in VALIDATE_ONLY_STATES
+
+
 # --------------------------------------------------------------------------
 # Trading costs
 # --------------------------------------------------------------------------

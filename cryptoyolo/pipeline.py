@@ -13,7 +13,7 @@ from typing import Any, Callable
 import pandas as pd
 
 from . import (approval, broker as broker_mod, catalysts, engine, exits, feeds,
-               macro, positioning, regime as regime_mod, social)
+               kalshi_prediction, macro, positioning, regime as regime_mod, social)
 from .config import CONFIG, Config, credential_status, load_dotenv
 from .logsetup import get_logger
 from .notify import notify
@@ -72,10 +72,14 @@ def _finalize_equity(store: Store, broker, scores, cfg: Config, run_id: str) -> 
         if len(ec) < 3:
             return
         curve = ec.sort_values("ts")["equity"].astype(float)
-        peak = float(curve.cummax().iloc[-1])
-        last = float(curve.iloc[-1])
-        dd = (last / peak - 1.0) * 100 if peak > 0 else 0.0
-        if dd <= -cfg.notify.drawdown_alert_pct:
+        peaks = curve.cummax()
+        dds = ((curve / peaks - 1.0) * 100).where(peaks > 0, 0.0)
+        peak, last, dd = float(peaks.iloc[-1]), float(curve.iloc[-1]), float(dds.iloc[-1])
+        # Alert when the drawdown first crosses the threshold, not on every
+        # cycle it stays below it.
+        crossed = (dd <= -cfg.notify.drawdown_alert_pct
+                   and float(dds.iloc[-2]) > -cfg.notify.drawdown_alert_pct)
+        if crossed:
             _log.warning("equity drawdown %.1f%% (%.2f vs peak %.2f) [%s]",
                          dd, last, peak, mode)
             notify(f"{mode}: equity drawdown {dd:.1f}%",
@@ -93,8 +97,11 @@ def _cycle_summary(cfg: Config, run_id: str, *, regime: dict | None,
     execs = executions if executions is not None else pd.DataFrame()
     has_side = not props.empty and "side" in props.columns
     has_kind = not props.empty and "kind" in props.columns
+    has_status = not execs.empty and "status" in execs.columns
     rej = (execs["status"].map(broker_mod.is_rejected)
-           if not execs.empty and "status" in execs.columns else pd.Series(dtype=bool))
+           if has_status else pd.Series(dtype=bool))
+    val = (execs["status"].map(broker_mod.is_validate_only)
+           if has_status else pd.Series(dtype=bool))
     return {
         "run_id": run_id,
         "mode": cfg.execution.mode,
@@ -102,17 +109,21 @@ def _cycle_summary(cfg: Config, run_id: str, *, regime: dict | None,
         "proposals": int(len(props)),
         "buys": int((props["side"] == "BUY").sum()) if has_side else 0,
         "exits": int((props["kind"] == "exit").sum()) if has_kind else 0,
-        "executed": int((~rej).sum()) if len(rej) else 0,
+        "executed": int((~rej & ~val).sum()) if len(rej) else 0,
+        "validated": int(val.sum()) if len(val) else 0,
         "rejected": int(rej.sum()) if len(rej) else 0,
-        "equity": round(float(equity), 2) if equity else None,
+        # `is not None`, not truthy - a real $0.00 equity (fully drawn down)
+        # must show as 0.0, not "n/a"; the latter reads as "couldn't be
+        # measured", which is a materially different (and less alarming) fact.
+        "equity": round(float(equity), 2) if equity is not None else None,
     }
 
 
 def _log_summary(s: dict[str, Any]) -> None:
     _log.info("cycle %s done: mode=%s regime=%s proposals=%d (buy=%d exit=%d) "
-              "executed=%d rejected=%d equity=%s",
+              "executed=%d validated=%d rejected=%d equity=%s",
               s["run_id"], s["mode"], s["regime"], s["proposals"], s["buys"],
-              s["exits"], s["executed"], s["rejected"],
+              s["exits"], s["executed"], s.get("validated", 0), s["rejected"],
               f"${s['equity']:,.2f}" if s["equity"] is not None else "n/a")
 
 
@@ -173,6 +184,16 @@ def collect(store: Store, cfg: Config = CONFIG, scrape_reddit: bool = True,
             print(f"  ! Macro fetch failed: {exc}")
             stats["macro"] = 0
 
+    if scrape_feeds and cfg.kalshi_prediction.enabled:
+        if verbose:
+            print("\n[1e] Kalshi crypto price markets")
+        try:
+            stats["kalshi_prediction"] = kalshi_prediction.fetch(store, cfg, verbose)
+        except Exception as exc:  # noqa: BLE001 - engine still runs without it
+            _log.exception("Kalshi price-market fetch failed")
+            print(f"  ! Kalshi price-market fetch failed: {exc}")
+            stats["kalshi_prediction"] = 0
+
     if scan_catalysts:
         if verbose:
             print("\n[2/2] Catalysts (GitHub + news)")
@@ -221,14 +242,19 @@ def run(store: Store, cfg: Config = CONFIG, scrape_reddit: bool = True,
 
     store.save_scores(run_id, scores.to_dict("records"))
 
-    # If scoring only got prices out of the yfinance backstop, the other three
-    # feeds were unreachable this run — worth knowing before trusting the slate.
+    # If scoring only got prices out of the last-resort backstop, every
+    # earlier-priority feed was unreachable this run — worth knowing before
+    # trusting the slate. Compared against the CONFIGURED last source, not a
+    # literal "yfinance", so this keeps working if price_source_order is ever
+    # reordered or extended.
     px_sources = scores.attrs.get("price_sources", [])
-    if px_sources == ["yfinance"] and cfg.notify.on_price_fallback:
-        _log.warning("price feed fell through to yfinance only")
-        notify("price feed fell back to yfinance",
-               "binance / coinbase / kraken were all unreachable this run; "
-               "prices came from the yfinance backstop.", cfg, tag="warning")
+    backstop = cfg.price_source_order[-1] if cfg.price_source_order else None
+    if px_sources == [backstop] and backstop and cfg.notify.on_price_fallback:
+        _log.warning("price feed fell through to the %s backstop only", backstop)
+        notify(f"price feed fell back to {backstop}",
+               f"every earlier-priority source ({', '.join(cfg.price_source_order[:-1])}) "
+               f"was unreachable this run; prices came from the {backstop} backstop.",
+               cfg, tag="warning")
     elif px_sources:
         _log.info("price sources this run: %s", ", ".join(px_sources))
 
@@ -255,18 +281,30 @@ def run(store: Store, cfg: Config = CONFIG, scrape_reddit: bool = True,
     print("\n[regime] reading BTC trend...")
     regime = regime_mod.assess(cfg, store=store)
     print(f"  {regime_mod.describe(regime)}")
+    prev_state = store.last_regime_state()
     store.record_regime(run_id, regime)   # so its own effect can be measured later
     _log.info("run %s regime=%s scale=%.2f", run_id, regime.get("state"),
               float(regime.get("exposure_scale", 1.0)))
-    if regime.get("state") == "risk_off" and cfg.notify.on_regime_risk_off:
+    # Alert on the flip into risk_off, not on every cycle it persists.
+    if (regime.get("state") == "risk_off" and prev_state != "risk_off"
+            and cfg.notify.on_regime_risk_off):
         notify(f"{cfg.execution.mode}: regime risk_off",
                regime.get("note", "BTC-trend gate is blocking new long entries."),
                cfg, tag="warning")
 
     print("\n[proposals] ranking candidates...")
-    risk_basis = (live_equity if (cfg.risk.size_off_live_equity and live_equity)
-                  else cfg.risk.account_equity_usd)
-    if cfg.risk.size_off_live_equity and live_equity:
+    # A truthy check on live_equity would treat a real $0.00 balance (fully
+    # drawn down, not unreadable) the same as "couldn't read it" and silently
+    # fall back to the static default — exactly what
+    # `RiskConfig.size_off_live_equity`'s own docstring says must NOT happen
+    # ("unknown is not treated as zero"). `is not None` is the actual
+    # unreadable/negative-guard-free test; negative equity can't legitimately
+    # occur here, but the >= 0 keeps a stray bug elsewhere from feeding a
+    # negative risk basis into sizing.
+    use_live_equity = (cfg.risk.size_off_live_equity
+                       and live_equity is not None and live_equity >= 0)
+    risk_basis = live_equity if use_live_equity else cfg.risk.account_equity_usd
+    if use_live_equity:
         print(f"  risk basis: ${risk_basis:,.2f} (live equity: ${cash:,.2f} cash "
               f"+ ${positions_value:,.2f} positions)")
     else:
@@ -341,7 +379,8 @@ def status(cfg: Config = CONFIG) -> pd.DataFrame:
         ("GitHub token", creds["github"],
          "optional — raises rate limit from 60/hr to 5000/hr"),
         ("Kalshi API key", creds["kalshi"],
-         "optional — macro regime dampener (Feature 6); no-op without it"),
+         "optional — macro regime dampener (Feature 6) + crypto price-prediction "
+         "signal (Feature 7); no-op without it"),
         ("CRYPTO_YOLO_ALLOW_LIVE", creds["live_trading_env"],
          "second switch required for real orders"),
         ("CRYPTO_YOLO_ALLOW_AUTO_LIVE", creds["auto_live_env"],
