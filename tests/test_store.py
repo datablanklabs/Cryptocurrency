@@ -18,12 +18,13 @@ def test_prices_daily_round_trip_and_upsert(store: Store, make_series):
     assert list(got["close"]) == [100, 101, 102, 103, 104]
     assert str(got["date"].dt.tz) == "UTC"
 
-    # re-upsert with changed values -> updated in place, not duplicated
+    # re-upsert from another source -> finalised past closes are NOT rewritten
     store.upsert_daily_prices_from_series("BTC", make_series([9, 9, 9, 9, 9],
                                                             start="2026-02-01"), "coinbase")
     got2 = store.daily_prices("BTC")
     assert len(got2) == 5
-    assert set(got2["close"]) == {9.0}
+    assert list(got2["close"]) == [100, 101, 102, 103, 104]
+    assert set(got2["source"]) == {"kraken"}
 
     cov = store.daily_price_coverage()
     assert cov.loc[cov["symbol"] == "BTC", "days"].iloc[0] == 5
@@ -102,3 +103,57 @@ def test_macro_latest_drops_rows_older_than_since(store: Store):
     ])
     assert store.macro_latest(datetime(2025, 1, 1, tzinfo=timezone.utc)).empty
     assert not store.macro_latest().empty
+
+
+def test_kalshi_price_markets_latest_is_newest_row_per_ticker(store: Store):
+    store.upsert_kalshi_prediction([
+        {"ticker": "KXBTCD-100K", "series_ticker": "KXBTCD", "symbol": "BTC",
+         "strike": 100_000.0, "probability": 0.5, "volume": 10,
+         "close_time": "c1", "fetched_at": "2026-01-01T00:00:00+00:00"},
+        {"ticker": "KXBTCD-100K", "series_ticker": "KXBTCD", "symbol": "BTC",
+         "strike": 100_000.0, "probability": 0.6, "volume": 20,
+         "close_time": "c1", "fetched_at": "2026-01-02T00:00:00+00:00"},
+    ])
+    latest = store.kalshi_prediction_latest()
+    assert len(latest) == 1
+    assert latest["probability"].iloc[0] == 0.6      # newest fetch wins
+
+    hist = store.kalshi_prediction_history("BTC")
+    assert len(hist) == 2                            # full history is kept, not overwritten
+
+
+def test_kalshi_price_markets_latest_drops_rows_older_than_since(store: Store):
+    from datetime import datetime, timezone
+
+    store.upsert_kalshi_prediction([
+        {"ticker": "KXOLD-1", "series_ticker": "KXOLD", "symbol": "OLD",
+         "strike": 1.0, "probability": 0.5, "volume": 5, "close_time": "",
+         "fetched_at": "2020-01-01T00:00:00+00:00"},
+    ])
+    assert store.kalshi_prediction_latest(datetime(2025, 1, 1, tzinfo=timezone.utc)).empty
+    assert not store.kalshi_prediction_latest().empty
+
+
+def test_prices_daily_skips_todays_still_forming_candle(store: Store):
+    today = pd.Timestamp.now(tz="UTC").normalize()
+    s = pd.Series([10.0, 11.0], index=[today - pd.Timedelta(days=1), today])
+    assert store.upsert_daily_prices_from_series("SOL", s, "binance") == 1
+    got = store.daily_prices("SOL")
+    assert list(got["date"]) == [today - pd.Timedelta(days=1)]
+
+
+def test_prices_daily_replaces_only_provisional_rows(store: Store):
+    """A row fetched on its own date (intraday, before this fix) is
+    provisional and gets its final close; a row fetched later is final."""
+    store.upsert_daily_prices([
+        {"symbol": "BTC", "date": "2026-03-01", "close": 1.0, "source": "a",
+         "fetched_at": "2026-03-01T13:05:00+00:00"},      # intraday -> provisional
+        {"symbol": "BTC", "date": "2026-03-02", "close": 2.0, "source": "a",
+         "fetched_at": "2026-03-03T13:05:00+00:00"},      # after the day -> final
+    ])
+    store.upsert_daily_prices([
+        {"symbol": "BTC", "date": d, "close": 99.0, "source": "b", "fetched_at": iso()}
+        for d in ("2026-03-01", "2026-03-02")
+    ])
+    got = store.daily_prices("BTC")
+    assert list(got["close"]) == [99.0, 2.0]

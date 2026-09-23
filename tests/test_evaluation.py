@@ -10,6 +10,7 @@ import pandas as pd
 import pytest
 
 from cryptoyolo import evaluation
+from cryptoyolo.store import Store
 
 
 @pytest.fixture(autouse=True)
@@ -120,7 +121,14 @@ def test_recommend_weights_keeps_hand_set_when_evidence_is_thin():
 def test_forward_returns_reads_stored_prices_and_never_hits_the_network(
         store, cfg, make_series, monkeypatch):
     series = make_series([100.0 + i for i in range(400)], start="2026-05-01")
+    # Scores below are stamped "now", so the forward window needs closes past
+    # today — which the writer refuses (still-forming candle). Pin its clock
+    # past the series' end for this one write.
+    from datetime import datetime, timezone
+    monkeypatch.setattr("cryptoyolo.store.utcnow",
+                        lambda: datetime(2027, 7, 1, tzinfo=timezone.utc))
     store.upsert_daily_prices_from_series("BTC", series, "test")
+    monkeypatch.undo()
 
     def _no_network(*a, **k):
         raise AssertionError("evaluation must not fetch prices when the table is populated")
@@ -140,3 +148,19 @@ def test_forward_returns_reads_stored_prices_and_never_hits_the_network(
     assert fr["fwd_7d"].notna().all()
     assert fr["fwd_30d"].notna().all()
     assert (fr["fwd_7d"] > 0).all()        # a rising ramp -> positive forward return
+
+
+def test_price_series_does_not_alias_across_different_stores(tmp_path, cfg, make_series):
+    """Regression guard: the cache used to key on `store is not None` (a bool),
+    so two different Store instances for the same symbol/timeframe collided on
+    the same cache entry and the second store silently got the first one's
+    series back."""
+    s1 = Store(tmp_path / "one.sqlite")
+    s2 = Store(tmp_path / "two.sqlite")
+    s1.upsert_daily_prices_from_series("BTC", make_series([100.0] * 10), "test")
+    s2.upsert_daily_prices_from_series("BTC", make_series([200.0] * 10), "test")
+
+    p1 = evaluation.price_series("BTC", cfg, store=s1)
+    p2 = evaluation.price_series("BTC", cfg, store=s2)
+    assert p1.iloc[-1] == pytest.approx(100.0)
+    assert p2.iloc[-1] == pytest.approx(200.0)          # not aliased to s1's series

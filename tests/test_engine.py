@@ -79,6 +79,19 @@ def test_propose_sizes_so_a_stop_out_costs_exactly_risk_per_trade(store):
     assert p["reward_risk"] == pytest.approx(2.0, rel=1e-9)
 
 
+def test_propose_treats_zero_live_equity_as_a_real_basis_not_unreadable(store):
+    """A genuinely wiped-out $0.00 account must size off $0, not silently fall
+    back to the static account_equity_usd default - a truthy check on
+    equity_override (0.0 is falsy) used to conflate "zero" with "unknown"."""
+    cfg = _sizing_cfg()
+    cfg.risk.size_off_live_equity = True
+    cfg.risk.account_equity_usd = 10_000.0
+    props = engine.propose(_one_row_frame(atr_pct_daily=0.04), store, "r0", cfg,
+                           holdings={}, cash_available=None, equity_override=0.0)
+    assert props.empty                                    # $0 basis -> nothing proposable
+    assert props.attrs["risk_equity"] == 0.0               # not the $10,000 static fallback
+
+
 def test_propose_fee_adjusted_target_hits_net_reward_risk(store):
     cfg = _sizing_cfg()
     cfg.risk.fee_adjust_targets = True

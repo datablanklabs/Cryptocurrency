@@ -17,9 +17,9 @@ def test_normalized_weights_sum_to_one():
 
 
 def test_normalized_all_zero_falls_back_to_uniform():
-    w = ScoreWeights(0, 0, 0, 0, 0, xsec_momentum_blend=0.42).normalized()
-    assert (w.technical, w.social, w.catalyst, w.positioning, w.events) == (
-        0.2, 0.2, 0.2, 0.2, 0.2)
+    w = ScoreWeights(0, 0, 0, 0, 0, 0, xsec_momentum_blend=0.42).normalized()
+    assert (w.technical, w.social, w.catalyst, w.positioning, w.events,
+           w.kalshi_prediction) == ((1 / 6,) * 6)
     assert w.xsec_momentum_blend == 0.42          # blend is not a family, kept as-is
 
 

@@ -52,6 +52,23 @@ def test_disabled_gate_returns_full_size(monkeypatch):
     assert v["exposure_scale"] == 1.0
 
 
+def test_disabled_gate_ignores_macro_even_with_a_store_and_a_bad_reading(monkeypatch):
+    """`enabled=False` must mean full size unconditionally - `describe()` prints
+    'full size regardless of trend', not 'unless macro disagrees'. A regression
+    guard: assess() used to route through _apply_macro() even when disabled, so
+    a macro score at/below macro_risk_off_threshold could still force risk_off
+    on a gate the operator explicitly turned off."""
+    _patch_prices(monkeypatch, list(np.linspace(360, 100, 260)))   # would be risk_off
+    monkeypatch.setattr(regime.macro_mod, "score",
+                        lambda store, cfg: {"n_series": 1, "score": -0.99, "note": "shutdown"})
+    cfg = Config()
+    cfg.regime.enabled = False
+    v = regime.assess(cfg, store=object())
+    assert v["state"] == "risk_on"
+    assert v["exposure_scale"] == 1.0
+    assert v["macro_score"] is None
+
+
 def test_price_fetch_failure_degrades_to_neutral(monkeypatch):
     def _boom(*a, **k):
         raise RuntimeError("all sources down")
