@@ -131,11 +131,13 @@ cryptoyolo/
   catalysts.py    Feature 3 — GitHub releases, news RSS, event taxonomy
   calendar_events.py  Feature 5 — scheduled dated events (unlocks, mainnets, ETF dates)
   macro.py        Feature 6 — Kalshi event-contract prices (Fed, CPI, shutdown risk, ...)
+  kalshi_prediction.py  Feature 7 — Kalshi's own crypto price markets, interpolated
+                  at spot into a per-asset directional score
   regime.py       BTC-trend regime gate: how much long exposure the tape justifies,
                   dampened (never boosted) by macro.py's read
   portfolio_risk.py  correlation matrix + sqrt(r' C r) heat of a candidate slate
   exits.py        five configurable exit triggers for open positions
-  engine.py       scoring (5 families + xsec momentum), ranking, risk-based sizing
+  engine.py       scoring (6 families + xsec momentum), ranking, risk-based sizing
   broker.py       signed Binance REST client + paper broker + the fee/slippage model
   approval.py     per-trade approval gate
   pipeline.py     end-to-end orchestration (equity snapshot + structured summary per cycle)
@@ -349,11 +351,14 @@ as momentum confirmation instead. Both are defensible; neither is tested here.
 
 **Weights:** families are added without rescaling the others — `normalized()`
 divides by the sum, so `positioning = 0.10` alongside `0.50/0.20/0.30` just
-makes room and every prior ratio holds. `events` ships at **0.0** because its
-schedule is empty — a non-zero weight on an all-zero family only dilutes the
-rest; raise it to ~0.15 once you populate `SCHEDULED_EVENTS`. Set any weight to
-`0.0` to drop that family. Don't trust these numbers — run `evaluation` and use
-`recommend_weights()`.
+makes room and every prior ratio holds. `events` and `kalshi_prediction` both
+ship at **0.0** because their inputs are empty (`SCHEDULED_EVENTS` /
+`KALSHI_CRYPTO_SERIES`) — a non-zero weight on an all-zero family only dilutes
+the rest; raise `events` to ~0.15 once you populate `SCHEDULED_EVENTS`, and
+`kalshi_prediction` to ~0.10 (deliberately modest — see Feature 7's
+short-dated caveat) once you populate `KALSHI_CRYPTO_SERIES`. Set any weight
+to `0.0` to drop that family. Don't trust these numbers — run `evaluation` and
+use `recommend_weights()`.
 
 A caveat visible today: all 20 assets currently sit at the funding cap, so
 positioning applies a near-uniform bearish tilt. The **discrimination** comes
@@ -400,21 +405,66 @@ list of series to read — Fed rate decisions, CPI prints, government-shutdown
 risk, recession odds — the kind of broad macro uncertainty that moves risk
 assets generally, crypto included, in a way nothing else here can see coming.
 
-Each series contributes `direction × (probability − 0.5) × 2 × weight` to a
-weight-normalised blend in [-1, 1]: a contract priced at a coin flip (50%)
-contributes nothing, one priced near-certain contributes its full weight.
-`direction` (does a YES resolution favor or hurt risk assets?) is a hand-set
-prior, same spirit as `catalysts.py`'s `EVENT_TYPES` — argue with it in
-`MACRO_SERIES`.
+Each series is scored against its own **`baseline`** — the probability that
+is normal for that event (e.g. ~15% for a recession starting this year) — not
+a 50% coin flip. Only a reading *worse* than normal counts:
+`−weight × (P(bad) − baseline) / (1 − baseline)`, where P(bad) is P(YES) for a
+bad event (`direction −1`) and P(NO) for a good one (`+1`). A reading at or
+better than normal contributes **0**, never a positive amount — the gate can
+only dampen, so a calm series has nothing to add and must not cancel out an
+alarming one. The blend is the weight-normalised mean, in [-1, 0]; calm series
+still count in the denominator, so forcing risk_off takes broad stress rather
+than one alarming market. `direction` and `baseline` are hand-set priors, same
+spirit as `catalysts.py`'s `EVENT_TYPES` — argue with them in `MACRO_SERIES`.
 
-**Ships empty, like `SCHEDULED_EVENTS`.** The series tickers are placeholders,
-not verified — Kalshi's catalog changes and this repo can't know today's exact
-strings. Run `cryptoyolo.macro.list_series(query="fed")` (needs working
-credentials) to find the real ones. Needs a Kalshi API key (RSA key pair, see
-`.env.example`); without one, `fetch()` skips and the regime fold-in is a
-no-op.
+**Ships populated** with series verified against the live API on 2026-09-22:
+P(Fed hike at the next FOMC, `KXFEDDECISION`), P(core CPI m/m above 0.3%,
+`KXCPICORE`), P(US recession starts this year, `KXRECSSNBER`) and government
+shutdown (`KXGOVSHUT`, only listed around funding deadlines). `fetch()` pages
+through every open market in a series and reads only the soonest-closing
+event. Series with several markets per event name the ones to read via
+`outcomes` (ticker suffixes, summed — so they must be mutually exclusive, e.g.
+hike-25 + hike->25). Kalshi's catalog changes; if a series stops returning
+markets, `cryptoyolo.macro.list_series(query="fed")` finds current tickers.
+Needs a Kalshi API key (RSA key pair, see `.env.example`); without one,
+`fetch()` skips and the regime fold-in is a no-op.
 
 **Only ever dampens, never boosts.** See the regime section below.
+
+### 7 · Kalshi crypto price-prediction markets
+
+`kalshi_prediction.py`. Unlike Feature 6, this IS a scored family — it feeds
+the composite, not the regime gate. A Kalshi crypto series
+(`config.py::KALSHI_CRYPTO_SERIES`, e.g. mapping `"BTC"` to a series ticker)
+lists a ladder of "will price be above \$X at close" markets sharing one
+expiration. Interpolating that ladder's (strike, P(YES)) points at the
+asset's **current spot price** gives the market's own estimate of
+`P(price ends above where it is right now)` — a directional read priced by
+people with money on the line.
+
+No hand-set `direction` prior is needed here, unlike `MACRO_SERIES`: "YES"
+always and only means "price ends higher", so the interpolated probability
+itself *is* the signal. `deviation = (p_up − 0.5) × 2`, clamped to [-1, 1] —
+a coin-flip reading contributes nothing, a near-certain one contributes its
+full value. Only the soonest-closing event's ladder is read (all open
+markets are paged through; each series' latest fetch only, expired markets
+dropped). A spot price outside the observed strikes scores **0 (no opinion)**
+— a ladder entirely above spot only bounds P(up), it doesn't price it.
+
+Two honest caveats, matching Feature 6's:
+
+- **Short-dated.** These markets are typically same-day or same-week
+  expiries, while this book generally holds 1–30 days (`exits.horizon_days`).
+  Treat this as a near-term tilt, not a horizon match — `ScoreWeights.kalshi_prediction`
+  defaults low for that reason.
+- **Only single-strike "above" markets are read.** Kalshi also lists "between
+  \$X and \$Y" range buckets on some series; those aren't a simple point on a
+  survival curve and are skipped rather than mis-modelled.
+
+**Ships empty, like `SCHEDULED_EVENTS`.** `KALSHI_CRYPTO_SERIES` tickers are
+placeholders, not verified. Run `cryptoyolo.kalshi_prediction.list_series(query="bitcoin")`
+(needs working credentials) to find the real ones. Reuses the same Kalshi API
+key as Feature 6 — no separate credential.
 
 ### Cross-sectional momentum
 
@@ -580,8 +630,9 @@ multiplied by this. Exits are never gated.
 
 **Macro can dampen the gate further, never loosen it.** When `regime.assess()`
 is called with a `store` (as the pipeline does), it folds in `macro.py`'s
-Kalshi-derived score: a bad-but-not-extreme reading multiplies exposure down
-by up to `1 - macro_downweight` (floored at `macro_min_multiplier`); a reading
+Kalshi-derived score: a bad-but-not-extreme reading multiplies exposure by
+`1 + score × macro_downweight` (default 1.0, so a −0.2 score cuts 20%),
+floored at `macro_min_multiplier`; a reading
 at or below `macro_risk_off_threshold` (default -0.6) forces `risk_off`
 outright, regardless of what the BTC trend alone said. A calm or supportive
 macro reading never increases exposure past what the trend earned — this
@@ -826,7 +877,7 @@ the environment at runtime, and `.env` is gitignored.
 | `REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET` | Feature 2 | falls back to keyless sources; still works |
 | `BINANCE_API_KEY` / `BINANCE_API_SECRET` | Execution | paper mode works fully |
 | `GITHUB_TOKEN` | Feature 3 | works; 60 req/hr caps the scan |
-| `KALSHI_API_KEY_ID` / `KALSHI_PRIVATE_KEY_PATH` | Feature 6 (macro regime dampener) | macro fetch skips; regime fold-in is a no-op |
+| `KALSHI_API_KEY_ID` / `KALSHI_PRIVATE_KEY_PATH` | Feature 6 (macro regime dampener) + Feature 7 (crypto price-prediction family) | both fetches skip; regime fold-in and the kalshi_prediction family are no-ops |
 | `CRYPTO_YOLO_ALLOW_LIVE` | Live orders | orders stay validate-only |
 | `CRYPTO_YOLO_LOG_LEVEL` | log verbosity (`INFO` default) | INFO |
 | `CRYPTO_YOLO_NTFY_URL` | push alerts via [ntfy](https://ntfy.sh) | alerts still logged + macOS banner |
@@ -855,7 +906,7 @@ line. `CONFIG.notify.enabled = False` turns it all off.
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                          # ~65 tests, no network, throwaway SQLite
+pytest                          # ~84 tests, no network, throwaway SQLite
 python3 build_notebook.py       # regenerate the (gitignored) notebook
 ```
 

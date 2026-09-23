@@ -133,6 +133,13 @@ def main() -> int:
             log.exception("macro fetch failed")
             print(f"  ! macro fetch failed: {exc}")
 
+        from cryptoyolo import kalshi_prediction
+        try:
+            kalshi_prediction.fetch(store, CONFIG, verbose=True)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Kalshi price-market fetch failed")
+            print(f"  ! Kalshi price-market fetch failed: {exc}")
+
         if args.catalysts:
             from cryptoyolo import catalysts
             try:

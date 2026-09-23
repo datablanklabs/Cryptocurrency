@@ -119,6 +119,7 @@ from cryptoyolo import (charts, engine, evaluation, indicators, pipeline, prices
 from cryptoyolo import calendar_events as events_mod
 from cryptoyolo import catalysts as catalysts_mod
 from cryptoyolo import feeds as feeds_mod
+from cryptoyolo import kalshi_prediction as kalshi_prediction_mod
 from cryptoyolo import macro as macro_mod
 from cryptoyolo import social as social_mod
 from cryptoyolo.config import CONFIG, TIMEFRAMES, load_dotenv
@@ -132,7 +133,8 @@ store = Store(CONFIG.db_path)
 _required = {"exits": "exit management", "risk": "risk sizing",
              "execution": "order execution", "fees": "fee model",
              "regime": "regime gate", "events": "scheduled events",
-             "macro": "macro backdrop (Kalshi)"}
+             "macro": "macro backdrop (Kalshi)",
+             "kalshi_prediction": "Kalshi crypto price markets"}
 _missing = [f"CONFIG.{a} ({why})" for a, why in _required.items()
             if not hasattr(CONFIG, a)]
 if _missing:
@@ -157,7 +159,7 @@ Nothing is hard-coded. Create a `.env` next to this notebook (see `.env.example`
 | `REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET` | Feature 2 | falls back to keyless sources — still works |
 | `BINANCE_API_KEY` / `BINANCE_API_SECRET` | Execution | paper mode still works fully |
 | `GITHUB_TOKEN` | Feature 3 | works, but 60 req/hr caps the universe scan |
-| `KALSHI_API_KEY_ID` / `KALSHI_PRIVATE_KEY_PATH` | Feature 6 | macro fetch skips; regime gate runs on BTC trend alone |
+| `KALSHI_API_KEY_ID` / `KALSHI_PRIVATE_KEY_PATH` | Features 6 & 7 | macro fetch skips (regime gate runs on BTC trend alone) and the Kalshi price-prediction family scores 0 |
 | `CRYPTO_YOLO_ALLOW_LIVE=1` | Live orders | orders stay validate-only |
 
 Reddit credentials are **optional** — the scraper falls back to Arctic Shift (a
@@ -234,15 +236,28 @@ CONFIG.regime.block_new_entries_when_risk_off = True
 # ── Macro backdrop (Feature 6 — Kalshi, dampens the regime gate above) ──
 # Only ever DAMPENS exposure_scale, never boosts it. A macro score at/below
 # macro_risk_off_threshold forces risk_off outright; anything less extreme
-# scales exposure down by up to (1 - macro_downweight), floored at
-# macro_min_multiplier. Ships a no-op: config.py::MACRO_SERIES is empty
-# until you populate it with real Kalshi series tickers (see Feature 6).
+# multiplies exposure by (1 + score * macro_downweight), floored at
+# macro_min_multiplier. LIVE BY DEFAULT once a Kalshi key is set:
+# config.py::MACRO_SERIES ships populated (Fed hike, hot core CPI, recession,
+# shutdown). Set CONFIG.regime.macro_enabled = False to opt out.
 CONFIG.regime.macro_enabled            = True
 CONFIG.regime.macro_risk_off_threshold = -0.6
-CONFIG.regime.macro_downweight         = 0.5
+CONFIG.regime.macro_downweight         = 1.0     # a -0.2 macro score cuts exposure 20%
+CONFIG.regime.macro_min_multiplier     = 0.5     # floor on that cut (short of forced risk_off)
 CONFIG.macro.enabled                   = True
 CONFIG.macro.min_volume                = 1       # ignore untraded (meaningless-price) markets
 CONFIG.macro.stale_after_hours         = 36.0    # older snapshot = treated as no-data
+
+# ── Kalshi crypto price markets (Feature 7 — a scored family) ───────────
+# Distinct from the macro dampener above: this reads Kalshi's own BTC/ETH
+# price-threshold markets and interpolates each asset's strike ladder at its
+# CURRENT spot price to get a market-implied P(price ends higher from here).
+# Reads only the soonest-closing expiry; a spot price outside its strikes
+# scores 0 (no opinion). Ships a no-op: config.py::KALSHI_CRYPTO_SERIES is
+# empty until you populate it with real Kalshi series tickers (see Feature 7).
+CONFIG.kalshi_prediction.enabled           = True
+CONFIG.kalshi_prediction.min_volume        = 1        # ignore untraded strikes
+CONFIG.kalshi_prediction.stale_after_hours = 6.0      # short-dated markets go stale fast
 
 # ── Scheduled events (Feature 5 — the one forward-looking family) ───────
 # Token unlocks, mainnet dates, ETF decisions, listing effective dates. The
@@ -280,6 +295,7 @@ CONFIG.weights.social      = 0.20
 CONFIG.weights.catalyst    = 0.30
 CONFIG.weights.positioning = 0.10
 CONFIG.weights.events      = 0.0    # scheduled dated catalysts — raise to ~0.15 once SCHEDULED_EVENTS is filled
+CONFIG.weights.kalshi_prediction = 0.0  # Kalshi crypto price markets — raise once KALSHI_CRYPTO_SERIES is filled
 # Cross-sectional momentum blended into the technical score (not a family):
 # technical_final = 0.7·technical + 0.3·xsec_rank. 0.0 restores the isolated score.
 CONFIG.weights.xsec_momentum_blend = 0.30
@@ -339,7 +355,8 @@ CONFIG.execution.trailing_delta_bps      = 0       # 0 = derive from CONFIG.exit
 
 w = CONFIG.weights.normalized()
 print(f"weights    : technical {w.technical:.0%} · social {w.social:.0%} · catalyst {w.catalyst:.0%} "
-      f"· positioning {w.positioning:.0%} · events {w.events:.0%}")
+      f"· positioning {w.positioning:.0%} · events {w.events:.0%} "
+      f"· kalshi_prediction {w.kalshi_prediction:.0%}")
 print(f"risk/trade : {CONFIG.risk.risk_per_trade_pct:.1f}% of "
       f"{'live equity' if CONFIG.risk.size_off_live_equity else f'${CONFIG.risk.account_equity_usd:,.0f}'}")
 print(f"stop       : {CONFIG.risk.stop_scaling} "
@@ -732,10 +749,20 @@ of series (`config.py::MACRO_SERIES` — Fed decisions, CPI prints,
 government-shutdown risk) and blends them into one score that can only ever
 **dampen** the BTC-trend deployment scale, never boost it.
 
-`MACRO_SERIES` ships empty — until you populate it with real Kalshi series
-tickers (run `macro_mod.list_series(CONFIG, query="fed")` with working
-credentials to find them), this section reports "no data" and the regime gate
-runs exactly as it did before this feature existed.
+Each series is judged against its own normal level (`MacroSeries.baseline`,
+e.g. ~15% for a Fed hike at any given meeting), not a 50% coin flip: only
+readings worse than normal count, and a calm series scores 0 rather than
+offsetting an alarming one. The score therefore runs from 0 (everything at or
+better than normal) down to -1.
+
+`MACRO_SERIES` ships populated with verified series — P(Fed hike at the next
+FOMC), P(core CPI m/m above 0.3%), P(US recession starts this year) and
+government shutdown — so **as soon as a Kalshi API key is configured, this
+dampener is live** and can cut (or, at/below `macro_risk_off_threshold`,
+zero) the regime gate's exposure. Without a key, or with
+`CONFIG.regime.macro_enabled = False`, this section reports "no data" and the
+gate runs on the BTC trend alone. If a series stops returning markets,
+`macro_mod.list_series(CONFIG, query="fed")` finds current tickers.
 """),
 
 code(r"""
@@ -744,16 +771,21 @@ n_macro = macro_mod.fetch(store, CONFIG, verbose=True)
 macro_read = macro_mod.score(store, CONFIG)
 print(f"\n{macro_mod.describe(macro_read)}")
 if not macro_read["detail"].empty:
+    # probability vs baseline (its normal level): only readings worse than
+    # normal carry a (negative) contribution.
     display(macro_read["detail"].style.format({
-        "probability": "{:.0%}", "contribution": "{:+.3f}", "weight": "{:.2f}",
+        "probability": "{:.0%}", "baseline": "{:.0%}",
+        "contribution": "{:+.3f}", "weight": "{:.2f}",
     }).hide(axis="index"))
 """),
 
 code(r"""
-# Snapshot: where each configured series stands right now.
+# Snapshot: where each configured series stands right now. The black tick on
+# each bar is that series' normal level; red bars are worse than normal.
 charts.macro_chart(macro_read["detail"]).show()
 
-# History: how it got there. Builds up one point per macro.fetch() call (this
+# History: how it got there — each series' combined probability (e.g. hike
+# 25bp + hike >25bp), as scored. Builds up one point per macro.fetch() call (this
 # cell, plus the 8-hourly collector job if it's running) — a single point is
 # expected right after first setting this feature up.
 charts.macro_history_chart(store.macro_history()).show()
@@ -761,11 +793,54 @@ charts.macro_history_chart(store.macro_history()).show()
 
 md(r"""
 ---
+## Feature 7 · Kalshi crypto price markets
+
+Unlike Feature 6 above, this IS a scored family — it feeds the composite, not
+the regime gate. `config.py::KALSHI_CRYPTO_SERIES` maps each asset to the
+Kalshi series listing that asset's own "will price be above \$X" markets, all
+sharing one expiration. Given that ladder of (strike, P(YES)) pairs,
+interpolating at the asset's CURRENT spot price gives the market's own
+estimate of P(price ends above where it is right now) — a directional read
+priced by people with money on the line, with no hand-set direction prior
+needed (unlike `MACRO_SERIES`): "YES" here always and only means "price ends
+higher".
+
+Two honest caveats: it's short-dated (same-day/week expiries against this
+book's 1-30 day holds, hence the low default weight), and it only reads
+single-strike "above" markets — Kalshi's "between \$X and \$Y" range buckets
+aren't a simple point on a survival curve and are skipped.
+
+Only the soonest-closing expiry is read (one survival curve, never strikes
+mixed across expiries), from the latest fetch, with already-closed markets
+dropped. If the spot price sits outside that ladder's strikes the family
+scores **0 — no opinion**: a ladder entirely above spot only bounds P(up), it
+doesn't price it.
+
+`KALSHI_CRYPTO_SERIES` ships empty — until you populate it with real Kalshi
+series tickers (run `kalshi_prediction_mod.list_series(CONFIG, query="bitcoin")`
+with working credentials to find them), this family scores 0.0 for every asset.
+"""),
+
+code(r"""
+n_kalshi_px = kalshi_prediction_mod.fetch(store, CONFIG, verbose=True)
+
+kalshi_ladder = kalshi_prediction_mod.latest_ladder(store, CONFIG)
+if not kalshi_ladder.empty:
+    display(kalshi_ladder.sort_values(["symbol", "strike"]).style.format({
+        "strike": "{:,.0f}", "probability": "{:.0%}",
+    }).hide(axis="index"))
+else:
+    print("no live Kalshi price-market snapshot yet")
+"""),
+
+md(r"""
+---
 ## Decision engine
 
 Composite = `w_technical × technical + w_social × social + w_catalyst × catalyst
-+ w_positioning × positioning + w_events × events` — the normalised form of the
-weights set in Configuration, each component in [-1, +1]. `technical` is itself
++ w_positioning × positioning + w_events × events
++ w_kalshi_prediction × kalshi_prediction` — the normalised form of the weights
+set in Configuration, each component in [-1, +1]. `technical` is itself
 `0.7 × (per-asset technical) + 0.3 × (cross-sectional momentum rank)`, so a
 column `technical_raw` shows the isolated score and `xsec` the universe-relative
 part.
@@ -781,13 +856,13 @@ scores = engine.build_scores(store, CONFIG, verbose=True)
 
 display(scores[[
     "symbol", "composite", "technical", "technical_raw", "xsec", "social",
-    "catalyst", "positioning", "events", "price", "rsi_1w", "atr_pct_daily",
-    "mentions_24h", "n_events", "top_event",
+    "catalyst", "positioning", "events", "kalshi_prediction", "price", "rsi_1w",
+    "atr_pct_daily", "mentions_24h", "n_events", "top_event",
 ]].style.format({
     "composite": "{:+.3f}", "technical": "{:+.3f}", "technical_raw": "{:+.3f}",
     "xsec": "{:+.2f}", "social": "{:+.3f}", "catalyst": "{:+.3f}",
-    "positioning": "{:+.3f}", "events": "{:+.3f}", "price": "{:,.4f}",
-    "atr_pct_daily": "{:.2%}",
+    "positioning": "{:+.3f}", "events": "{:+.3f}", "kalshi_prediction": "{:+.3f}",
+    "price": "{:,.4f}", "atr_pct_daily": "{:.2%}",
 }).background_gradient(subset=["composite"], cmap="RdYlGn", vmin=-0.6, vmax=0.6)
   .hide(axis="index"))
 """),
@@ -872,6 +947,11 @@ tells you whether they mean anything: it joins every stored score to the asset's
 **realised** forward return, measures each family's information coefficient
 (rank-correlation with return), reconstructs the actual round-trip trades net of
 fees, and compares the equity curve to simply holding BTC.
+
+Forward returns come from the local `prices_daily` record, which is
+point-in-time: a day's close is stored only once that UTC day has ended, and
+is never rewritten afterwards (not even by a cycle that fell back to another
+price source) — so re-running this section gives the same numbers.
 
 With only a couple of weeks of data every number here is noisy — a t-stat under
 ~2 is "no evidence", not a finding. Re-run this weekly; act on it after a month.
