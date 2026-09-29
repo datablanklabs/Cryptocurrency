@@ -383,7 +383,8 @@ def propose(scores: pd.DataFrame, store: Store, run_id: str, cfg: Config = CONFI
             cash_available: float | None = None,
             exit_signals: pd.DataFrame | None = None,
             equity_override: float | None = None,
-            regime: dict[str, Any] | None = None) -> pd.DataFrame:
+            regime: dict[str, Any] | None = None,
+            halt: dict[str, Any] | None = None) -> pd.DataFrame:
     """Turn scores into at most `cfg.risk.max_proposals` sized trade candidates.
 
     Sizing is risk-first: the stop distance comes from ATR, and quantity is set
@@ -412,6 +413,9 @@ def propose(scores: pd.DataFrame, store: Store, run_id: str, cfg: Config = CONFI
 
     SELLs are exempt from the cash cap, the deployment cap and the regime gate:
     an exit releases capital and reduces risk.
+
+    `halt` is the output of `loss_halt.assess()`. When it has tripped, new BUYs
+    are dropped outright (exits still run), whatever the regime says.
     """
     risk = cfg.risk
     holdings = holdings or {}
@@ -435,6 +439,7 @@ def propose(scores: pd.DataFrame, store: Store, run_id: str, cfg: Config = CONFI
         deploy_scale = float(regime.get("exposure_scale", 1.0))
         if regime_state == "risk_off" and cfg.regime.block_new_entries_when_risk_off:
             block_buys = True
+    halted = bool(halt and halt.get("tripped"))
 
     relative = risk.selection_mode == "relative"
     entry_floor = risk.min_composite_floor if relative else risk.min_composite_score
@@ -453,6 +458,7 @@ def propose(scores: pd.DataFrame, store: Store, run_id: str, cfg: Config = CONFI
         df.attrs["min_composite_score"] = entry_floor
         df.attrs["risk_equity"] = risk_equity
         df.attrs["regime"] = regime_state
+        df.attrs["halt_note"] = (halt or {}).get("note", "")
         return df
 
     if scores.empty:
@@ -466,7 +472,7 @@ def propose(scores: pd.DataFrame, store: Store, run_id: str, cfg: Config = CONFI
     # an empty wallet, which is a misdiagnosis, not a shortcut.
     skipped: dict[str, int] = {"below_score": 0, "bearish_unheld": 0,
                                "below_min_notional": 0, "flagged_for_exit": 0,
-                               "regime_blocked": 0}
+                               "regime_blocked": 0, "halted": 0, "already_held": 0}
     # Every symbol under an exit signal, whether or not the exit itself makes it
     # into a slot. A dust-sized position can fail the minimum-notional check and
     # so produce no sellable ticket - but it must still never come back as a BUY
@@ -549,9 +555,21 @@ def propose(scores: pd.DataFrame, store: Store, run_id: str, cfg: Config = CONFI
             skipped["below_score"] += 1
             continue
 
+        # Already holding it: re-buying because it still ranks top pays a new
+        # entry fee for exposure we have. Skip before the slot count, so the
+        # slot goes to the next name down.
+        held_value = held * float(row["price"])
+        if (side == "BUY" and not risk.add_to_positions
+                and held_value >= risk.min_notional_usd):
+            skipped["already_held"] += 1
+            continue
+
         # BUY slots are the budgeted resource; risk-reducing SELLs are not and
         # are never suppressed by a full BUY slate.
         if side == "BUY" and n_buys >= risk.max_proposals:
+            continue
+        if side == "BUY" and halted:
+            skipped["halted"] += 1
             continue
         if side == "BUY" and block_buys:
             skipped["regime_blocked"] += 1
@@ -597,6 +615,10 @@ def propose(scores: pd.DataFrame, store: Store, run_id: str, cfg: Config = CONFI
         qty = risk_budget / stop_dist if stop_dist > 0 else 0.0
 
         max_notional = risk_equity * (risk.max_position_pct / 100.0)
+        if side == "BUY":
+            # The cap is on the position, not the order: an add may only top
+            # the holding up to it.
+            max_notional = max(0.0, max_notional - held_value)
         if side == "BUY" and buying_power is not None:
             # No single purchase may exceed what will actually be spendable
             # once this run's exits have settled.
@@ -837,9 +859,16 @@ def format_proposals(proposals: pd.DataFrame) -> str:
         if sk.get("bearish_unheld"):
             lines.append(f"  · {sk['bearish_unheld']} were bearish on assets you "
                          f"don't hold — spot can't short, so that's an avoid.")
+        if sk.get("halted"):
+            lines.append(f"  · {sk['halted']} BUY(s) blocked — LOSS HALT "
+                         f"({proposals.attrs.get('halt_note', '')}). Exits still run; "
+                         f"resume with CONFIG.risk.halt_reset_after.")
         if sk.get("regime_blocked"):
             lines.append(f"  · {sk['regime_blocked']} BUY(s) blocked — market regime is "
                          f"risk_off ({proposals.attrs.get('regime', '?')}). Exits still run.")
+        if sk.get("already_held"):
+            lines.append(f"  · {sk['already_held']} ranked high but are already held — "
+                         f"not re-bought (CONFIG.risk.add_to_positions = False).")
         if sk.get("flagged_for_exit"):
             lines.append(f"  · {sk['flagged_for_exit']} are already flagged for exit.")
         if sk.get("no_scores"):

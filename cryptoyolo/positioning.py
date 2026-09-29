@@ -79,6 +79,25 @@ def fetch(store: Store, cfg: Config = CONFIG, verbose: bool = True) -> int:
     return len(rows)
 
 
+def score_rates(rates, pc) -> tuple[float, float, float, float]:
+    """(latest, mean, z, score) for one asset's funding history, oldest first.
+
+    Shared with `backtest`, so the historical replay scores funding exactly as
+    a live cycle does.
+    """
+    latest = float(rates[-1])
+    # The latest point is included in its own reference distribution. At
+    # n>=20 the distortion is tiny (measured 0.04 z on ETH at n=100) and
+    # excluding it would make the score jump around as the window rolls,
+    # so it stays in deliberately.
+    mean = float(rates.mean())
+    std = float(rates.std(ddof=0))
+    z = (latest - mean) / std if std > 1e-12 else 0.0
+    raw = math.tanh(z / pc.z_scale) if pc.z_scale else 0.0
+    score = -raw if pc.contrarian else raw
+    return latest, mean, z, float(max(-1.0, min(1.0, score)))
+
+
 def score_symbols(store: Store, cfg: Config = CONFIG) -> pd.DataFrame:
     """Per-asset positioning score in [-1, 1].
 
@@ -101,24 +120,14 @@ def score_symbols(store: Store, cfg: Config = CONFIG) -> pd.DataFrame:
             continue
 
         rates = sub.sort_values("funding_time")["rate"].to_numpy()
-        latest = float(rates[-1])
-        # The latest point is included in its own reference distribution. At
-        # n>=20 the distortion is tiny (measured 0.04 z on ETH at n=100) and
-        # excluding it would make the score jump around as the window rolls,
-        # so it stays in deliberately.
-        mean = float(rates.mean())
-        std = float(rates.std(ddof=0))
-        z = (latest - mean) / std if std > 1e-12 else 0.0
-        raw = math.tanh(z / pc.z_scale) if pc.z_scale else 0.0
-        score = -raw if pc.contrarian else raw
-
+        latest, mean, z, score = score_rates(rates, pc)
         rows.append({
             "symbol": symbol,
             "funding_now": round(latest * 100, 6),      # as a percentage
             "funding_mean": round(mean * 100, 6),
             "funding_z": round(z, 4),
             "n_periods": int(len(rates)),
-            "positioning": round(float(max(-1.0, min(1.0, score))), 4),
+            "positioning": round(score, 4),
         })
 
     return pd.DataFrame(rows).sort_values("positioning", key=abs, ascending=False

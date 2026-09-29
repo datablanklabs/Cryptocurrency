@@ -18,24 +18,27 @@ import pandas as pd
 
 from . import prices as prices_mod
 from .broker import get_broker
-from .config import CONFIG, Config
-from .store import Store
+from .config import CONFIG, STABLECOINS, Config
+from .store import Store, book_of
 
-STABLES = {"USDT", "USDC", "BUSD", "DAI", "TUSD", "USD"}
+STABLES = STABLECOINS
 DUST_USD = 1.0          # ignore balances worth less than this
 
 
 def _cost_basis_from_orders(store: Store) -> dict[str, dict[str, float]]:
-    """Average cost per symbol, derived from this system's own filled orders.
+    """Average cost per symbol, derived from this system's own live fills.
 
-    Only covers trades placed through this dashboard. Positions opened
-    elsewhere legitimately have no basis here.
+    Only covers trades placed through this dashboard (plus fills
+    `reconcile` imported for pairs it tracks). Positions opened elsewhere
+    legitimately have no basis here. Paper fills are a different book and
+    must not leak into a live account's basis.
     """
     with store.conn() as con:
         df = pd.read_sql_query(
             "SELECT symbol, side, qty, price FROM orders "
-            "WHERE status IN ('FILLED','SENT') AND qty > 0 AND price > 0 "
-            "ORDER BY ts ASC", con,
+            "WHERE mode = 'binance-live' "
+            "AND status IN ('FILLED','PARTIALLY_FILLED','SENT') "
+            "AND qty > 0 AND price > 0 ORDER BY ts ASC", con,
         )
     basis: dict[str, dict[str, float]] = {}
     for _, r in df.iterrows():
@@ -87,7 +90,7 @@ def snapshot(store: Store, cfg: Config = CONFIG) -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001 - show quantities even if pricing fails
             warnings.append(f"Could not price holdings: {exc}")
 
-    meta_df = store.position_meta()
+    meta_df = store.position_meta(book=book_of(mode))
     pmeta = {r["symbol"]: dict(r) for _, r in meta_df.iterrows()} if not meta_df.empty else {}
 
     rows: list[dict[str, Any]] = []

@@ -41,7 +41,7 @@ import numpy as np
 import pandas as pd
 
 from . import prices as prices_mod
-from .config import CONFIG, Config, ScoreWeights
+from .config import CONFIG, STABLECOINS, Config, ScoreWeights
 from .store import Store
 
 FAMILIES = ("technical", "social", "catalyst", "positioning", "events",
@@ -55,6 +55,9 @@ FAMILIES = ("technical", "social", "catalyst", "positioning", "events",
 # different series (local table vs live API) and must not alias each other.
 _PX_CACHE: dict[tuple[str, str, bool], pd.Series | None] = {}
 _MIN_SERIES = 5
+# A remainder a SELL leaves behind that is worth less than this at entry is
+# lot-size rounding dust (the exchange's step size), not a position.
+DUST_USD = 1.0
 
 
 def _as_ns(s: pd.Series) -> pd.Series:
@@ -166,6 +169,10 @@ def forward_returns(store: Store, cfg: Config = CONFIG,
     if refresh:
         clear_cache()
     sc = store.scores_history(since)
+    # Older runs scored stablecoins held in the account; they have no return to
+    # rank and would sit at the bottom of every cross-section.
+    if not sc.empty:
+        sc = sc[~sc["symbol"].isin(STABLECOINS)].reset_index(drop=True)
     if sc.empty:
         return pd.DataFrame()
 
@@ -229,7 +236,8 @@ def _overlap_factor(run_ids: pd.Index, run_ts: pd.Series, horizon: int) -> float
 
 
 def information_coefficient(fr: pd.DataFrame,
-                            horizons: tuple[int, ...] = (1, 7, 30)
+                            horizons: tuple[int, ...] = (1, 7, 30),
+                            families: tuple[str, ...] = FAMILIES,
                             ) -> pd.DataFrame:
     """Rank-correlation of each family with forward return, per run then averaged.
 
@@ -243,7 +251,7 @@ def information_coefficient(fr: pd.DataFrame,
     """
     if fr.empty:
         return pd.DataFrame()
-    fams = [f for f in FAMILIES if f in fr.columns]
+    fams = [f for f in families if f in fr.columns]
     run_ts = fr.groupby("run_id")["ts"].min() if "ts" in fr.columns else pd.Series(dtype=object)
     rows: list[dict[str, Any]] = []
     for h in horizons:
@@ -354,11 +362,17 @@ def realized_trades(store: Store, cfg: Config = CONFIG) -> pd.DataFrame:
     Paper and live fills are kept separate (`mode`) because their cost models
     differ. Open lots left at the end are reported with `close_ts` NaT and
     marked to the latest price.
+
+    When a SELL leaves a sliver of a lot behind worth under `DUST_USD` (the
+    exchange rounds the sell down to its lot step), that sliver is folded into
+    the trade that just closed rather than reported as a separate open trade -
+    otherwise every rounded exit shows up as an extra, usually "winning", trade.
     """
     orders = store.all_orders()
     if orders.empty:
         return pd.DataFrame()
-    orders = orders[orders["status"].isin(["FILLED", "SENT"])].copy()
+    # PARTIALLY_FILLED is a real position (an IOC entry sized to its fill).
+    orders = orders[orders["status"].isin(["FILLED", "PARTIALLY_FILLED", "SENT"])].copy()
     if orders.empty:
         return pd.DataFrame()
 
@@ -394,6 +408,11 @@ def realized_trades(store: Store, cfg: Config = CONFIG) -> pd.DataFrame:
             lot["fee"] -= entry_fee_alloc
             remaining -= take
             if lot["qty"] <= 1e-12:
+                book.pop(0)
+            elif lot["qty"] * lot["px"] < DUST_USD:
+                # Rounding dust: its leftover entry fee belongs to this trade.
+                closed[-1]["fees"] += lot["fee"]
+                closed[-1]["net_pnl"] -= lot["fee"]
                 book.pop(0)
 
     open_syms = sorted({k[0] for k, v in lots.items()
@@ -452,6 +471,99 @@ def trade_stats(trades: pd.DataFrame) -> pd.DataFrame:
 # --------------------------------------------------------------------------
 # Benchmarks
 # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Execution quality
+# --------------------------------------------------------------------------
+_SENT = ("FILLED", "PARTIALLY_FILLED", "EXPIRED_NO_FILL", "REJECTED")
+
+
+def execution_quality(store: Store, cfg: Config = CONFIG, mode: str = "binance-live",
+                      horizons: tuple[int, ...] = (1, 7)) -> dict[str, Any]:
+    """How orders actually executed against the prices they were proposed at.
+
+    by_type        per side x order type: how many were sent, filled, partly
+                   filled, expired unfilled (an IOC limit that matched nothing),
+                   rejected, or refused by the slippage guard before sending
+    slippage       fill vs proposal entry in bps, signed so positive = paid away
+                   (a BUY above entry, a SELL below it), and realised fee bps
+    missed_vs_filled  for BUY entries: realised forward return of the ones that
+                   filled vs the ones that expired unfilled. If the misses keep
+                   outrunning the fills, the limit is missing exactly the names
+                   that take off (adverse selection). Repeat attempts on the same
+                   symbol and day are one setup (`setups`).
+
+    Engine-sent orders only (fills `reconcile` imported are excluded). Forward
+    returns come from the local `prices_daily` table - no network.
+    """
+    with store.conn() as con:
+        df = pd.read_sql_query(
+            "SELECT o.ts, o.symbol, o.side, o.order_type, o.qty, o.price, o.status, "
+            "o.fee_usd, p.entry FROM orders o LEFT JOIN proposals p "
+            "ON o.proposal_id = p.proposal_id "
+            "WHERE o.mode = ? AND o.order_id NOT LIKE 'bnc-x-%'", con, params=(mode,))
+    if df.empty:
+        return {}
+    df["ts"] = pd.to_datetime(df["ts"], utc=True, format="ISO8601")
+    df["side"] = df["side"].str.upper()
+
+    def _count(g: pd.DataFrame) -> pd.Series:
+        st = g["status"]
+        sent = st.isin(_SENT).sum()
+        done = st.isin(["FILLED", "PARTIALLY_FILLED"]).sum()
+        return pd.Series({
+            "sent": int(sent), "filled": int((st == "FILLED").sum()),
+            "partial": int((st == "PARTIALLY_FILLED").sum()),
+            "expired_no_fill": int((st == "EXPIRED_NO_FILL").sum()),
+            "rejected": int((st == "REJECTED").sum()),
+            "refused_guard": int((st == "REJECTED_SLIPPAGE").sum()),
+            "fill_rate_%": round(done / sent * 100, 1) if sent else np.nan,
+        })
+
+    by_type = (df.groupby(["side", "order_type"])[["status"]].apply(_count)
+               .reset_index())
+    for c in ("sent", "filled", "partial", "expired_no_fill", "rejected", "refused_guard"):
+        by_type[c] = by_type[c].astype(int)
+
+    fills = df[df["status"].isin(["FILLED", "PARTIALLY_FILLED"])
+               & (df["price"] > 0) & (df["entry"] > 0)].copy()
+    slip = pd.DataFrame()
+    if not fills.empty:
+        sign = np.where(fills["side"] == "BUY", 1.0, -1.0)
+        fills["slip_bps"] = sign * (fills["price"] / fills["entry"] - 1.0) * 10_000
+        notional = fills["qty"] * fills["price"]
+        fills["fee_bps"] = np.where(notional > 0, fills["fee_usd"] / notional * 10_000, np.nan)
+        slip = (fills.groupby(["side", "order_type"])
+                .agg(fills=("slip_bps", "size"),
+                     slip_mean_bps=("slip_bps", "mean"),
+                     slip_median_bps=("slip_bps", "median"),
+                     fee_mean_bps=("fee_bps", "mean"))
+                .round(1).reset_index())
+
+    buys = df[(df["side"] == "BUY") & df["status"].isin(
+        ["FILLED", "PARTIALLY_FILLED", "EXPIRED_NO_FILL"])].copy()
+    mvf = pd.DataFrame()
+    if not buys.empty:
+        buys["outcome"] = np.where(buys["status"] == "EXPIRED_NO_FILL", "missed", "filled")
+        series = {sym: _series_from_store(store, sym) for sym in buys["symbol"].unique()}
+        for h in horizons:
+            buys[f"fwd_{h}d"] = [_fwd_return(series[r.symbol], r.ts, h)
+                                 for r in buys.itertuples()]
+        buys["setup"] = buys["symbol"] + buys["ts"].dt.strftime("%Y-%m-%d")
+        rows = []
+        for outcome, g in buys.groupby("outcome"):
+            row: dict[str, Any] = {"outcome": outcome, "attempts": len(g),
+                                   "setups": g["setup"].nunique()}
+            per_setup = g.groupby("setup")[[f"fwd_{h}d" for h in horizons]].mean()
+            for h in horizons:
+                col = per_setup[f"fwd_{h}d"].dropna()
+                row[f"n_{h}d"] = int(len(col))
+                row[f"mean_{h}d_%"] = round(col.mean() * 100, 2) if len(col) else np.nan
+                row[f"median_{h}d_%"] = round(col.median() * 100, 2) if len(col) else np.nan
+            rows.append(row)
+        mvf = pd.DataFrame(rows)
+    return {"mode": mode, "by_type": by_type, "slippage": slip, "missed_vs_filled": mvf}
+
+
 def benchmark_returns(cfg: Config = CONFIG, start: datetime | None = None,
                       end: datetime | None = None,
                       symbols: list[str] | None = None,
@@ -561,6 +673,18 @@ def equity_stats(store: Store, cfg: Config = CONFIG,
         "vs_btc_pp": (round(total_ret * 100 - bench["btc_buy_hold_%"], 2)
                       if bench.get("btc_buy_hold_%") is not None else np.nan),
     }
+
+
+def equity_stats_by_mode(store: Store, cfg: Config = CONFIG) -> dict[str, dict[str, Any]]:
+    """`equity_stats` for every snapshot mode on record, each its own curve.
+
+    Paper and live are different books; reporting only the "current" one hid a
+    live curve with 60+ snapshots behind a 3-snapshot paper one. Note the live
+    curve can't tell deposits and withdrawals from P&L.
+    """
+    ec = store.equity_curve(None).dropna(subset=["equity"])
+    modes = sorted(ec["mode"].dropna().unique()) if not ec.empty else []
+    return {m: equity_stats(store, cfg, mode=m) for m in modes}
 
 
 # --------------------------------------------------------------------------
@@ -695,6 +819,8 @@ def summary(store: Store, cfg: Config = CONFIG,
     trades = realized_trades(store, cfg)
     tstats = trade_stats(trades)
     eq = equity_stats(store, cfg)
+    eq_all = equity_stats_by_mode(store, cfg)
+    xq = execution_quality(store, cfg)
     rec = recommend_weights(fr, primary_horizon)
     regime_eff = regime_effectiveness(store, cfg, primary_horizon)
 
@@ -739,19 +865,34 @@ def summary(store: Store, cfg: Config = CONFIG,
         print("\n  Realised trades (net of fees):")
         print("  " + tstats.to_string(index=False).replace("\n", "\n  "))
 
-    if eq:
-        if eq.get("note"):
-            print(f"\n  Equity curve: {eq['note']}")
-        else:
-            print(f"\n  Equity curve ({eq['mode']}, {eq['snapshots']} snapshots, "
-                  f"{eq['span_days']}d):")
-            if eq.get("mode_note"):
-                print(f"    note: {eq['mode_note']}")
-            print(f"    total return {eq['total_return_%']:+.2f}%   "
-                  f"BTC buy-hold {eq['btc_buy_hold_%']:+.2f}%   "
-                  f"vs BTC {eq['vs_btc_pp']:+.2f}pp")
-            print(f"    max drawdown {eq['max_drawdown_%']:.2f}%   "
-                  f"Sharpe(annualised) {eq['sharpe_annualised']}")
+    if xq:
+        print(f"\n  Execution quality ({xq['mode']}, engine-sent orders):")
+        print("  " + xq["by_type"].to_string(index=False).replace("\n", "\n  "))
+        if not xq["slippage"].empty:
+            print("    fill vs proposal entry (+ = paid away) and realised fee:")
+            print("    " + xq["slippage"].to_string(index=False).replace("\n", "\n    "))
+        if not xq["missed_vs_filled"].empty:
+            print("    BUY entries that filled vs expired unfilled — forward return per setup:")
+            print("    " + xq["missed_vs_filled"].to_string(index=False)
+                  .replace("\n", "\n    "))
+            print("    misses consistently beating fills = the limit is missing the "
+                  "names that run; few setups = noise.")
+
+    if not eq_all and eq.get("note"):
+        print(f"\n  Equity curve: {eq['note']}")
+    for mode, e in eq_all.items():
+        if e.get("note"):
+            print(f"\n  Equity curve ({mode}): {e['note']}")
+            continue
+        print(f"\n  Equity curve ({mode}, {e['snapshots']} snapshots, "
+              f"{e['span_days']}d):")
+        print(f"    total return {e['total_return_%']:+.2f}%   "
+              f"BTC buy-hold {e['btc_buy_hold_%']:+.2f}%   "
+              f"vs BTC {e['vs_btc_pp']:+.2f}pp")
+        print(f"    max drawdown {e['max_drawdown_%']:.2f}%   "
+              f"Sharpe(annualised) {e['sharpe_annualised']}")
+        if mode != "paper":
+            print("    (deposits and withdrawals show up as returns on this curve)")
 
     if not regime_eff.empty:
         print(f"\n  Regime gate — realised {primary_horizon}d forward return by state:")
@@ -770,4 +911,6 @@ def summary(store: Store, cfg: Config = CONFIG,
 
     return {"forward_returns": fr, "ic": ic, "quantile_spread": spread,
             "hit_rate": hits, "trades": trades, "trade_stats": tstats,
-            "equity": eq, "recommendation": rec, "regime_effectiveness": regime_eff}
+            "equity": eq, "equity_by_mode": eq_all, "execution": xq,
+            "recommendation": rec,
+            "regime_effectiveness": regime_eff}

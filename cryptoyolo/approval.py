@@ -24,7 +24,7 @@ from .config import CONFIG, Config
 from .engine import fmt_price, fmt_qty
 from .logsetup import get_logger
 from .notify import notify
-from .store import Store, iso
+from .store import Store, book_of, iso
 
 _log = get_logger("approval")
 
@@ -207,9 +207,13 @@ def _sync_position_meta(proposal, record: dict, broker, store: Store,
     SELL that flattens the position clears the row so a future re-entry starts
     a fresh clock and high-water mark rather than inheriting stale terms.
     """
-    if is_rejected(record.get("status")):
+    # A rejection opened nothing, and neither did a validate-only order: it
+    # was checked by the exchange and discarded, so there is no position to
+    # give terms to.
+    if is_rejected(record.get("status")) or is_validate_only(record.get("status")):
         return
     symbol = record["symbol"]
+    book = book_of(record.get("mode", cfg.execution.mode))
 
     if record["side"].upper() == "BUY":
         fill = float(record.get("price") or proposal["entry"])
@@ -231,11 +235,11 @@ def _sync_position_meta(proposal, record: dict, broker, store: Store,
     except Exception:  # noqa: BLE001 - keep the row rather than lose the terms
         return
     if remaining <= 1e-9:
-        store.delete_position_meta(symbol)
+        store.delete_position_meta(symbol, book)
     elif str(proposal.get("trigger", "")) == "target hit":
         # A partial take-profit that leaves a remainder: retire the target so
         # it cannot fire again next run and halve the position repeatedly.
-        store.clear_position_target(symbol)
+        store.clear_position_target(symbol, book)
 
 
 def execute_approved(proposals: pd.DataFrame, broker, store: Store, run_id: str,

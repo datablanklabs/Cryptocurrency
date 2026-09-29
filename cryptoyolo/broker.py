@@ -387,6 +387,26 @@ class BinanceClient:
         """Cancel every resting order on a pair, including OCO legs."""
         return self._request("DELETE", "/api/v3/openOrders", {"symbol": pair}, signed=True)
 
+    # -- account history (reconciliation) ------------------------------------
+    def my_trades(self, pair: str, limit: int = 1000) -> list[dict]:
+        """The account's most recent fills on a pair, oldest first.
+
+        No time window on purpose: Binance caps startTime..endTime at 24h, while
+        with neither set it returns the latest `limit` fills - for a personal
+        account that is the whole history of the pair.
+        """
+        return self._request("GET", "/api/v3/myTrades",
+                             {"symbol": pair, "limit": int(limit)}, signed=True)
+
+    def get_order(self, pair: str, order_id: str | int) -> dict:
+        return self._request("GET", "/api/v3/order",
+                             {"symbol": pair, "orderId": int(order_id)}, signed=True)
+
+    def get_order_list(self, order_list_id: str | int) -> dict:
+        """One OCO: `listOrderStatus` plus the legs' orderIds."""
+        return self._request("GET", "/api/v3/orderList",
+                             {"orderListId": int(order_list_id)}, signed=True)
+
 
 # --------------------------------------------------------------------------
 # Brokers
@@ -438,14 +458,17 @@ class PaperBroker:
             "order_type": "SIMULATED", "exchange_ref": None, "order_list_id": None,
             "qty": float(record.get("qty") or proposal["qty"]),
             "stop_price": float(proposal["stop"]), "limit_price": None,
-            "target_price": float(proposal["target"]), "trailing_delta": None,
+            "target_price": float(proposal["target"]) if proposal.get("target") else None,
+            "trailing_delta": None,
             "status": "simulated", "mode": "paper", "venue": "paper",
             "placed_at": iso(), "response": json.dumps(
                 {"note": "paper mode — no resting order exists at any exchange"}),
         }
         self.store.save_protective_order(row)
-        print(f"    · protection simulated (paper): stop {proposal['stop']:,.6g} / "
-              f"target {proposal['target']:,.6g} — evaluated only when you run the exits pass")
+        target = (f"target {float(proposal['target']):,.6g}" if proposal.get("target")
+                  else "no target")
+        print(f"    · protection simulated (paper): stop {float(proposal['stop']):,.6g} / "
+              f"{target} — evaluated only when you run the exits pass")
         return row
 
     def cancel_protection(self, symbol: str) -> int:
@@ -633,10 +656,22 @@ class BinanceBroker:
         pair = self.pair(symbol)
         qty_raw = float(record.get("qty") or proposal["qty"])
         stop = float(proposal["stop"])
-        target = float(proposal["target"])
+        # A position whose partial take-profit already fired has no target left
+        # (see Store.clear_position_target); it is protected by the stop alone.
+        target = float(proposal["target"]) if proposal.get("target") else None
         # Limit sits below the trigger so a fast move still crosses it.
         stop_limit = stop * (1 - ex.stop_limit_offset_bps / 10_000.0)
-        want_both = ex.place_stop_orders and ex.place_limit_orders
+        want_both = ex.place_stop_orders and ex.place_limit_orders and target is not None
+        if not ex.place_stop_orders and target is None:
+            return None
+
+        # One protective order per position. Adding to a position that already
+        # has one would otherwise rest a second OCO for just the new lot - two
+        # resting sells, and a step towards the venue's algo-order cap. Replace
+        # it with one sized to the whole holding instead.
+        if self.live and not self.store.resting_orders(symbol).empty:
+            self.cancel_protection(symbol)
+            qty_raw = float(self.holdings().get(symbol, qty_raw))
 
         if want_both and not ex.use_oco:
             print(f"    ⚠ {symbol}: both stop and target requested with use_oco=False. "
@@ -646,7 +681,8 @@ class BinanceBroker:
         try:
             qty_s, stop_s, warn = self.client.normalize_order(pair, qty_raw, stop)
             _, stop_limit_s, _ = self.client.normalize_order(pair, qty_raw, stop_limit)
-            _, target_s, _ = self.client.normalize_order(pair, qty_raw, target)
+            target_s = (self.client.normalize_order(pair, qty_raw, target)[1]
+                        if target is not None else None)
         except BinanceError as exc:
             print(f"    ✗ {symbol}: cannot size protective order ({exc})")
             return None
@@ -657,7 +693,8 @@ class BinanceBroker:
                 "symbol": symbol, "kind": "oco" if want_both and ex.use_oco else "stop",
                 "order_type": "NOT_SENT", "exchange_ref": None, "order_list_id": None,
                 "qty": float(qty_s), "stop_price": float(stop_s),
-                "limit_price": float(stop_limit_s), "target_price": float(target_s),
+                "limit_price": float(stop_limit_s),
+                "target_price": float(target_s) if target_s else None,
                 "trailing_delta": self._trailing_delta(), "status": "simulated",
                 "mode": "binance-test", "venue": self.venue, "placed_at": iso(),
                 "response": json.dumps({"note": "not sent — validate-only mode. Binance "
@@ -665,7 +702,8 @@ class BinanceBroker:
             }
             self.store.save_protective_order(row)
             print(f"    · protection NOT sent ({symbol}): validate-only mode. Would rest "
-                  f"stop {stop_s} (limit {stop_limit_s}) / target {target_s}.")
+                  f"stop {stop_s} (limit {stop_limit_s})"
+                  + (f" / target {target_s}." if target_s else " (no target)."))
             return row
 
         trailing = self._trailing_delta()
@@ -701,7 +739,8 @@ class BinanceBroker:
             "symbol": symbol, "kind": kind, "order_type": otype,
             "exchange_ref": ref, "order_list_id": str(resp.get("orderListId") or "") or None,
             "qty": float(qty_s), "stop_price": float(stop_s),
-            "limit_price": float(stop_limit_s), "target_price": float(target_s),
+            "limit_price": float(stop_limit_s),
+            "target_price": float(target_s) if target_s else None,
             "trailing_delta": trailing, "status": status, "mode": "binance-live",
             "venue": self.venue, "placed_at": iso(),
             "response": json.dumps({"warnings": warn, "response": resp}, default=str),

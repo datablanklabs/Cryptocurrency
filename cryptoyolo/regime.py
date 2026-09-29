@@ -103,8 +103,51 @@ def _apply_macro(rc, state: str, scale: float, cfg: Config,
     return state, scale, info
 
 
+def classify(close: pd.Series, rc) -> dict[str, Any]:
+    """The BTC-trend verdict from daily closes alone - no fetch, no macro.
+
+    Pure, so the backtest can replay the gate exactly as `assess` applies it.
+    Returns `state`, `exposure_scale` and the numbers behind the call; with too
+    little history, `abstain` is set and the state is neutral.
+    """
+    close = close.astype(float).dropna()
+    if len(close) < rc.min_candles:
+        return {"state": "neutral", "exposure_scale": rc.neutral_exposure,
+                "abstain": (f"only {len(close)} daily candles (< min_candles "
+                            f"{rc.min_candles}); MA unreliable, abstaining (neutral)")}
+
+    # If history is short of ma_days, use what we have and SAY the window is
+    # shorter than advertised rather than silently computing a faster MA.
+    win = min(rc.ma_days, len(close))
+    ma_series = _sma(close, win)
+    price = float(close.iloc[-1])
+    ma = float(ma_series.iloc[-1])
+    if not np.isfinite(ma) or ma <= 0:
+        return {"state": "neutral", "exposure_scale": rc.neutral_exposure,
+                "abstain": "moving average not computable yet; abstaining (neutral)"}
+
+    band = rc.ma_band_pct / 100.0
+    upper, lower = ma * (1 + band), ma * (1 - band)
+    pct_vs_ma = price / ma - 1.0
+    lookback = min(21, len(ma_series) - 1)
+    ma_prev = float(ma_series.iloc[-1 - lookback])
+    ma_slope = (ma / ma_prev - 1.0) if np.isfinite(ma_prev) and ma_prev > 0 else 0.0
+    trail_high = float(close.iloc[-min(len(close), 180):].max())
+    dd = price / trail_high - 1.0
+
+    if price < lower or dd <= -rc.drawdown_risk_off_pct / 100.0:
+        state, scale = "risk_off", rc.risk_off_exposure
+    elif price > upper and ma_slope > 0:
+        state, scale = "risk_on", rc.risk_on_exposure
+    else:
+        state, scale = "neutral", rc.neutral_exposure
+    return {"state": state, "exposure_scale": scale, "abstain": None,
+            "price": price, "ma": ma, "win": int(win), "lookback": lookback,
+            "pct_vs_ma": pct_vs_ma, "ma_slope": ma_slope, "drawdown": dd}
+
+
 def assess(cfg: Config = CONFIG, symbol: str = "BTC",
-          store: Store | None = None) -> dict[str, Any]:
+           store: Store | None = None) -> dict[str, Any]:
     """Classify the current regime from `symbol`'s daily candles.
 
     Returns a dict with `state`, `exposure_scale` (the multiplier for the
@@ -139,56 +182,23 @@ def assess(cfg: Config = CONFIG, symbol: str = "BTC",
         return {**_blank(rc, symbol, state, scale, note + _macro_note_suffix(macro_info)),
                **macro_info}
 
-    if len(close) < rc.min_candles:
-        state, scale, macro_info = _apply_macro(
-            rc, "neutral", rc.neutral_exposure, cfg, store)
-        note = (f"only {len(close)} daily candles (< min_candles "
-                f"{rc.min_candles}); MA unreliable, abstaining (neutral)")
-        return {**_blank(rc, symbol, state, scale, note + _macro_note_suffix(macro_info)),
-               **macro_info}
-
-    # If history is short of ma_days, use what we have and SAY the window is
-    # shorter than advertised rather than silently computing a faster MA.
-    win = min(rc.ma_days, len(close))
-    ma_series = _sma(close, win)
-    price = float(close.iloc[-1])
-    ma = float(ma_series.iloc[-1])
-    if not np.isfinite(ma) or ma <= 0:
-        state, scale, macro_info = _apply_macro(
-            rc, "neutral", rc.neutral_exposure, cfg, store)
-        note = "moving average not computable yet; abstaining (neutral)"
-        return {**_blank(rc, symbol, state, scale, note + _macro_note_suffix(macro_info)),
-               **macro_info}
-
-    band = rc.ma_band_pct / 100.0
-    upper, lower = ma * (1 + band), ma * (1 - band)
-    pct_vs_ma = price / ma - 1.0
-    lookback = min(21, len(ma_series) - 1)
-    ma_prev = float(ma_series.iloc[-1 - lookback])
-    ma_slope = (ma / ma_prev - 1.0) if np.isfinite(ma_prev) and ma_prev > 0 else 0.0
-    trail_high = float(close.iloc[-min(len(close), 180):].max())
-    dd = price / trail_high - 1.0
-
-    if price < lower or dd <= -rc.drawdown_risk_off_pct / 100.0:
-        state, scale = "risk_off", rc.risk_off_exposure
-    elif price > upper and ma_slope > 0:
-        state, scale = "risk_on", rc.risk_on_exposure
-    else:
-        state, scale = "neutral", rc.neutral_exposure
-
-    state, scale, macro_info = _apply_macro(rc, state, scale, cfg, store)
+    v = classify(close, rc)
+    state, scale, macro_info = _apply_macro(rc, v["state"], v["exposure_scale"], cfg, store)
+    if v["abstain"]:
+        return {**_blank(rc, symbol, state, scale,
+                         v["abstain"] + _macro_note_suffix(macro_info)), **macro_info}
 
     out = _blank(rc, symbol, state, scale, "")
     out.update(
-        source=src, btc_price=round(price, 2), btc_ma=round(ma, 2),
-        ma_window_used=int(win),
-        pct_vs_ma=round(pct_vs_ma * 100, 2),
-        ma_slope_pct=round(ma_slope * 100, 2),
-        drawdown_from_high_pct=round(dd * 100, 2),
-        note=(f"{symbol} {pct_vs_ma * 100:+.1f}% vs its "
-              f"{win}d MA{' (short history)' if win < rc.ma_days else ''} "
-              f"±{rc.ma_band_pct:.0f}% band (MA slope {ma_slope * 100:+.1f}% / "
-              f"{lookback}d, drawdown {dd * 100:.1f}% from trailing high)"
+        source=src, btc_price=round(v["price"], 2), btc_ma=round(v["ma"], 2),
+        ma_window_used=v["win"],
+        pct_vs_ma=round(v["pct_vs_ma"] * 100, 2),
+        ma_slope_pct=round(v["ma_slope"] * 100, 2),
+        drawdown_from_high_pct=round(v["drawdown"] * 100, 2),
+        note=(f"{symbol} {v['pct_vs_ma'] * 100:+.1f}% vs its "
+              f"{v['win']}d MA{' (short history)' if v['win'] < rc.ma_days else ''} "
+              f"±{rc.ma_band_pct:.0f}% band (MA slope {v['ma_slope'] * 100:+.1f}% / "
+              f"{v['lookback']}d, drawdown {v['drawdown'] * 100:.1f}% from trailing high)"
               + _macro_note_suffix(macro_info)),
     )
     out.update(macro_info)

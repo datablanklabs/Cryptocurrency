@@ -149,8 +149,14 @@ CREATE TABLE IF NOT EXISTS paper_cash (
 -- (when it was opened, where the stop is, how high it has run) are ours either
 -- way. Without this table a position has no memory and no exit can be time- or
 -- level-based.
+--
+-- Keyed by (symbol, book): the paper book and the Binance account are separate
+-- books that can hold the same symbol at the same time. Keyed by symbol alone,
+-- a paper fill overwrote a live position's stop/target, and a paper exit
+-- deleted a live position's terms.
 CREATE TABLE IF NOT EXISTS position_meta (
-    symbol       TEXT PRIMARY KEY,
+    symbol       TEXT NOT NULL,
+    book         TEXT NOT NULL DEFAULT 'binance',   -- 'paper' | 'binance'
     opened_at    TEXT NOT NULL,
     entry_price  REAL,
     stop         REAL,
@@ -159,7 +165,8 @@ CREATE TABLE IF NOT EXISTS position_meta (
     high_water   REAL,
     proposal_id  TEXT,
     mode         TEXT,
-    updated_at   TEXT
+    updated_at   TEXT,
+    PRIMARY KEY (symbol, book)
 );
 
 -- Protective orders resting at the exchange (or simulated in paper mode).
@@ -177,7 +184,7 @@ CREATE TABLE IF NOT EXISTS protective_orders (
     limit_price  REAL,
     target_price REAL,
     trailing_delta INTEGER,
-    status       TEXT,                -- 'resting' | 'cancelled' | 'simulated' | 'failed'
+    status       TEXT,                -- 'resting' | 'cancelled' | 'simulated' | 'failed' | 'filled'
     mode         TEXT,
     venue        TEXT,
     placed_at    TEXT NOT NULL,
@@ -245,6 +252,18 @@ CREATE TABLE IF NOT EXISTS regime_log (
 );
 CREATE INDEX IF NOT EXISTS idx_regime_ts ON regime_log(ts);
 
+-- The loss-halt verdict at each cycle (see loss_halt.py), so an alert fires
+-- only on the transition into a halt and the record shows when buying stopped.
+CREATE TABLE IF NOT EXISTS halt_log (
+    run_id          TEXT PRIMARY KEY,
+    ts              TEXT NOT NULL,
+    mode            TEXT,
+    tripped         INTEGER,
+    reason          TEXT,
+    drawdown_pct    REAL,
+    window_loss_pct REAL
+);
+
 -- Point-in-time daily closes, one row per (symbol, UTC date). Written every
 -- cycle from the 1y candles `build_scores` already fetches. `evaluation` reads
 -- forward returns from THIS table rather than re-pulling a sliding window from a
@@ -293,6 +312,15 @@ CREATE TABLE IF NOT EXISTS prices_daily (
 );
 CREATE INDEX IF NOT EXISTS idx_prices_daily_symbol ON prices_daily(symbol, date);
 """
+
+
+def book_of(mode: str | None) -> str:
+    """Which book an order/broker mode belongs to: 'paper' or 'binance'.
+
+    'binance-live' and 'binance-test' are the same account (validate-only
+    just never fills), so they share a book.
+    """
+    return "paper" if str(mode or "paper").startswith("paper") else "binance"
 
 
 def utcnow() -> datetime:
@@ -361,6 +389,34 @@ class Store:
         order_cols = {r["name"] for r in con.execute("PRAGMA table_info(orders)")}
         if "fee_usd" not in order_cols:
             con.execute("ALTER TABLE orders ADD COLUMN fee_usd REAL")
+
+        # position_meta keyed by symbol alone -> (symbol, book). SQLite can't
+        # change a primary key in place, so rebuild the table inside one
+        # transaction: either every row moves across with its book derived
+        # from `mode`, or nothing changes.
+        pm_cols = {r["name"] for r in con.execute("PRAGMA table_info(position_meta)")}
+        if "book" not in pm_cols:
+            con.executescript("""
+                BEGIN;
+                CREATE TABLE position_meta_v2 (
+                    symbol TEXT NOT NULL, book TEXT NOT NULL DEFAULT 'binance',
+                    opened_at TEXT NOT NULL, entry_price REAL, stop REAL,
+                    target REAL, horizon_days REAL, high_water REAL,
+                    proposal_id TEXT, mode TEXT, updated_at TEXT,
+                    PRIMARY KEY (symbol, book));
+                INSERT INTO position_meta_v2
+                    (symbol, book, opened_at, entry_price, stop, target,
+                     horizon_days, high_water, proposal_id, mode, updated_at)
+                SELECT symbol,
+                       CASE WHEN COALESCE(mode, 'paper') LIKE 'paper%'
+                            THEN 'paper' ELSE 'binance' END,
+                       opened_at, entry_price, stop, target, horizon_days,
+                       high_water, proposal_id, mode, updated_at
+                FROM position_meta;
+                DROP TABLE position_meta;
+                ALTER TABLE position_meta_v2 RENAME TO position_meta;
+                COMMIT;
+            """)
 
     def _init_schema(self) -> None:
         with self.conn() as con:
@@ -585,6 +641,21 @@ class Store:
             df["ts"] = pd.to_datetime(df["ts"], utc=True, format="ISO8601")
         return df
 
+    def live_orders(self, symbol: str | None = None) -> pd.DataFrame:
+        """Orders sent to a live venue (mode 'binance-live'), oldest first."""
+        q = ("SELECT order_id, proposal_id, run_id, ts, symbol, side, order_type, "
+             "qty, price, status, exchange_ref, fee_usd FROM orders "
+             "WHERE mode='binance-live'")
+        params: tuple = ()
+        if symbol:
+            q += " AND symbol=?"
+            params = (symbol,)
+        with self.conn() as con:
+            df = pd.read_sql_query(q + " ORDER BY ts ASC", con, params=params)
+        if not df.empty:
+            df["ts"] = pd.to_datetime(df["ts"], utc=True, format="ISO8601")
+        return df
+
     def all_orders(self) -> pd.DataFrame:
         """Full order log, oldest first — for realised-trade reconstruction."""
         with self.conn() as con:
@@ -617,6 +688,25 @@ class Store:
                 "SELECT state FROM regime_log ORDER BY ts DESC LIMIT 1").fetchone()
         return row[0] if row else None
 
+    # -- loss halt ----------------------------------------------------------
+    def record_halt(self, run_id: str, mode: str, verdict: dict[str, Any]) -> None:
+        with self.conn() as con:
+            con.execute(
+                """INSERT OR REPLACE INTO halt_log
+                   (run_id, ts, mode, tripped, reason, drawdown_pct, window_loss_pct)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (run_id, iso(), mode, int(bool(verdict.get("tripped"))),
+                 "; ".join(verdict.get("reasons") or []) or None,
+                 verdict.get("drawdown_pct"), verdict.get("window_loss_pct")),
+            )
+
+    def last_halt_state(self, mode: str) -> bool | None:
+        """Whether the most recent cycle in `mode` was halted; None if none yet."""
+        with self.conn() as con:
+            row = con.execute("SELECT tripped FROM halt_log WHERE mode=? "
+                              "ORDER BY ts DESC LIMIT 1", (mode,)).fetchone()
+        return bool(row[0]) if row else None
+
     def regime_history(self) -> pd.DataFrame:
         with self.conn() as con:
             df = pd.read_sql_query(
@@ -627,18 +717,21 @@ class Store:
         return df
 
     # -- position metadata --------------------------------------------------
+    # Every method is scoped to a BOOK ('paper' | 'binance', see book_of):
+    # the two books can hold the same symbol at once and must never share terms.
     def upsert_position_meta(self, row: dict[str, Any]) -> None:
         row = {**row}
+        row.setdefault("book", book_of(row.get("mode")))
         row.setdefault("updated_at", iso())
         row.setdefault("high_water", row.get("entry_price"))
         with self.conn() as con:
             con.execute(
                 """INSERT INTO position_meta
-                   (symbol, opened_at, entry_price, stop, target, horizon_days,
+                   (symbol, book, opened_at, entry_price, stop, target, horizon_days,
                     high_water, proposal_id, mode, updated_at)
-                   VALUES (:symbol,:opened_at,:entry_price,:stop,:target,
+                   VALUES (:symbol,:book,:opened_at,:entry_price,:stop,:target,
                            :horizon_days,:high_water,:proposal_id,:mode,:updated_at)
-                   ON CONFLICT(symbol) DO UPDATE SET
+                   ON CONFLICT(symbol, book) DO UPDATE SET
                      entry_price=excluded.entry_price,
                      -- Averaging up raises entry_price; leaving high_water
                      -- behind would make gain_from_entry negative and silently
@@ -649,35 +742,44 @@ class Store:
                      target=excluded.target,
                      horizon_days=excluded.horizon_days,
                      proposal_id=excluded.proposal_id,
+                     mode=excluded.mode,
                      updated_at=excluded.updated_at""",
                 row,
             )
 
-    def position_meta(self, symbol: str | None = None) -> pd.DataFrame:
+    def position_meta(self, symbol: str | None = None,
+                      book: str | None = None) -> pd.DataFrame:
+        """Entry terms, optionally for one symbol and/or one book."""
+        q, params = "SELECT * FROM position_meta WHERE 1=1", []
+        if symbol:
+            q += " AND symbol=?"
+            params.append(symbol)
+        if book:
+            q += " AND book=?"
+            params.append(book)
         with self.conn() as con:
-            if symbol:
-                return pd.read_sql_query(
-                    "SELECT * FROM position_meta WHERE symbol=?", con, params=(symbol,))
-            return pd.read_sql_query("SELECT * FROM position_meta", con)
+            return pd.read_sql_query(q, con, params=tuple(params))
 
-    def bump_high_water(self, symbol: str, price: float) -> float:
+    def bump_high_water(self, symbol: str, price: float, book: str) -> float:
         """Raise the high-water mark; never lowers it. Returns the mark in force."""
         with self.conn() as con:
             row = con.execute(
-                "SELECT high_water FROM position_meta WHERE symbol=?", (symbol,)
+                "SELECT high_water FROM position_meta WHERE symbol=? AND book=?",
+                (symbol, book),
             ).fetchone()
             if row is None:
                 return price
             current = float(row["high_water"] or 0.0)
             if price > current:
                 con.execute(
-                    "UPDATE position_meta SET high_water=?, updated_at=? WHERE symbol=?",
-                    (price, iso(), symbol),
+                    "UPDATE position_meta SET high_water=?, updated_at=? "
+                    "WHERE symbol=? AND book=?",
+                    (price, iso(), symbol, book),
                 )
                 return price
             return current
 
-    def clear_position_target(self, symbol: str) -> None:
+    def clear_position_target(self, symbol: str, book: str) -> None:
         """Retire the take-profit after a PARTIAL exit has taken it.
 
         Without this a partial take-profit re-fires on every run: the price is
@@ -689,13 +791,15 @@ class Store:
         """
         with self.conn() as con:
             con.execute(
-                "UPDATE position_meta SET target=NULL, updated_at=? WHERE symbol=?",
-                (iso(), symbol),
+                "UPDATE position_meta SET target=NULL, updated_at=? "
+                "WHERE symbol=? AND book=?",
+                (iso(), symbol, book),
             )
 
-    def delete_position_meta(self, symbol: str) -> None:
+    def delete_position_meta(self, symbol: str, book: str) -> None:
         with self.conn() as con:
-            con.execute("DELETE FROM position_meta WHERE symbol=?", (symbol,))
+            con.execute("DELETE FROM position_meta WHERE symbol=? AND book=?",
+                        (symbol, book))
 
     # -- funding rates ------------------------------------------------------
     def upsert_funding(self, rows: Iterable[dict[str, Any]]) -> int:
@@ -863,6 +967,22 @@ class Store:
         params: tuple = ()
         if symbol:
             q += " AND symbol=?"
+            params = (symbol,)
+        with self.conn() as con:
+            return pd.read_sql_query(q + " ORDER BY placed_at DESC", con, params=params)
+
+    def set_protective_status(self, row_id: int, status: str) -> None:
+        """Record what the exchange says became of one protective order."""
+        with self.conn() as con:
+            con.execute("UPDATE protective_orders SET status=?, updated_at=? WHERE id=?",
+                        (status, iso(), int(row_id)))
+
+    def protective_orders(self, symbol: str | None = None) -> pd.DataFrame:
+        """Every protective row, newest first (all statuses)."""
+        q = "SELECT * FROM protective_orders"
+        params: tuple = ()
+        if symbol:
+            q += " WHERE symbol=?"
             params = (symbol,)
         with self.conn() as con:
             return pd.read_sql_query(q + " ORDER BY placed_at DESC", con, params=params)

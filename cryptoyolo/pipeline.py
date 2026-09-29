@@ -13,11 +13,12 @@ from typing import Any, Callable
 import pandas as pd
 
 from . import (approval, broker as broker_mod, catalysts, engine, exits, feeds,
-               kalshi_prediction, macro, positioning, regime as regime_mod, social)
-from .config import CONFIG, Config, credential_status, load_dotenv
+               kalshi_prediction, loss_halt, macro, positioning, reconcile,
+               regime as regime_mod, social)
+from .config import CONFIG, STABLECOINS, Config, credential_status, load_dotenv
 from .logsetup import get_logger
 from .notify import notify
-from .store import Store, iso, utcnow
+from .store import Store, book_of, iso, utcnow
 
 _log = get_logger("pipeline")
 
@@ -92,7 +93,8 @@ def _finalize_equity(store: Store, broker, scores, cfg: Config, run_id: str) -> 
 def _cycle_summary(cfg: Config, run_id: str, *, regime: dict | None,
                    proposals: pd.DataFrame | None,
                    executions: pd.DataFrame | None,
-                   equity: float | None) -> dict[str, Any]:
+                   equity: float | None,
+                   halt: dict | None = None) -> dict[str, Any]:
     props = proposals if proposals is not None else pd.DataFrame()
     execs = executions if executions is not None else pd.DataFrame()
     has_side = not props.empty and "side" in props.columns
@@ -106,6 +108,7 @@ def _cycle_summary(cfg: Config, run_id: str, *, regime: dict | None,
         "run_id": run_id,
         "mode": cfg.execution.mode,
         "regime": (regime or {}).get("state", "n/a"),
+        "halted": bool((halt or {}).get("tripped")),
         "proposals": int(len(props)),
         "buys": int((props["side"] == "BUY").sum()) if has_side else 0,
         "exits": int((props["kind"] == "exit").sum()) if has_kind else 0,
@@ -120,9 +123,10 @@ def _cycle_summary(cfg: Config, run_id: str, *, regime: dict | None,
 
 
 def _log_summary(s: dict[str, Any]) -> None:
-    _log.info("cycle %s done: mode=%s regime=%s proposals=%d (buy=%d exit=%d) "
+    _log.info("cycle %s done: mode=%s regime=%s halted=%s proposals=%d (buy=%d exit=%d) "
               "executed=%d validated=%d rejected=%d equity=%s",
-              s["run_id"], s["mode"], s["regime"], s["proposals"], s["buys"],
+              s["run_id"], s["mode"], s["regime"], s.get("halted", False),
+              s["proposals"], s["buys"],
               s["exits"], s["executed"], s.get("validated", 0), s["rejected"],
               f"${s['equity']:,.2f}" if s["equity"] is not None else "n/a")
 
@@ -220,11 +224,25 @@ def run(store: Store, cfg: Config = CONFIG, scrape_reddit: bool = True,
 
     stats = collect(store, cfg, scrape_reddit, scan_catalysts)
 
+    if auto_approve is None:
+        auto_approve = cfg.execution.auto_approve
+    # A propose-only run must not touch the exchange's order book at all, so
+    # it also never places protection for existing positions. Nor does an
+    # unattended run against a live account that lacks the third switch
+    # (auto-approve refuses there, see approval._auto_approve).
+    ex = cfg.execution
+    may_execute = bool(interactive or (auto_approve and (not ex.live_enabled
+                                                         or ex.auto_live_enabled)))
+
     # Holdings first: assets you own must be scored even when they sit outside
     # the configured universe, or they can never produce an exit signal.
     pre_broker = broker_mod.get_broker(store, cfg)
+    # Live only: fold in fills made at the exchange without us (a resting stop
+    # that filled overnight, a manual trade) before anything reads positions.
+    stats["reconcile"] = reconcile.reconcile(store, pre_broker, cfg)
+    # Stablecoins are cash, not positions: there is nothing to exit.
     held_symbols = [s for s, q in (pre_broker.holdings() or {}).items()
-                    if q > 0 and s != cfg.execution.quote_asset]
+                    if q > 0 and s != cfg.execution.quote_asset and s not in STABLECOINS]
 
     print("\n[scoring] building composite scores...")
     if held_symbols:
@@ -267,7 +285,8 @@ def run(store: Store, cfg: Config = CONFIG, scrape_reddit: bool = True,
     live_equity = (cash + positions_value) if cash is not None else None
 
     print("\n[exits] reviewing open positions...")
-    exit_signals = exits.evaluate(store, cfg, holdings, scores)
+    exit_signals = exits.evaluate(store, cfg, holdings, scores,
+                                  book=book_of(getattr(broker, "mode", cfg.execution.mode)))
     if not cfg.exits.enabled:
         print("  exit management disabled (CONFIG.exits.enabled = False)")
     elif exit_signals.empty:
@@ -291,6 +310,18 @@ def run(store: Store, cfg: Config = CONFIG, scrape_reddit: bool = True,
         notify(f"{cfg.execution.mode}: regime risk_off",
                regime.get("note", "BTC-trend gate is blocking new long entries."),
                cfg, tag="warning")
+
+    # Loss halt: judged on this broker's own equity curve plus this cycle's
+    # live equity, before anything is proposed.
+    book = getattr(broker, "mode", cfg.execution.mode)
+    halt = loss_halt.assess(store, cfg, book, live_equity)
+    prev_halted = store.last_halt_state(book)
+    store.record_halt(run_id, book, halt)
+    print(f"  {loss_halt.describe(halt)}")
+    if halt["tripped"]:
+        _log.warning("run %s LOSS HALT: %s", run_id, halt["note"])
+        if not prev_halted and cfg.notify.on_loss_halt:
+            notify(f"{book}: loss halt — new buys blocked", halt["note"], cfg, tag="warning")
 
     print("\n[proposals] ranking candidates...")
     # A truthy check on live_equity would treat a real $0.00 balance (fully
@@ -319,14 +350,18 @@ def run(store: Store, cfg: Config = CONFIG, scrape_reddit: bool = True,
 
     proposals = engine.propose(scores, store, run_id, cfg, holdings,
                                cash_available=cash, exit_signals=exit_signals,
-                               equity_override=live_equity, regime=regime)
+                               equity_override=live_equity, regime=regime,
+                               halt=halt)
 
     if proposals.empty:
         print(engine.format_proposals(proposals))
+        if may_execute:
+            reconcile.protect_open_positions(store, broker, cfg)
         _finalize_equity(store, broker, scores, cfg, run_id)
         store.finish_run(run_id)
         summary = _cycle_summary(cfg, run_id, regime=regime, proposals=proposals,
-                                 executions=None, equity=live_equity)
+                                 executions=None, equity=live_equity,
+                                 halt=halt)
         _log_summary(summary)
         return {"run_id": run_id, "scores": scores, "proposals": proposals,
                 "executions": pd.DataFrame(), "stats": stats,
@@ -336,15 +371,14 @@ def run(store: Store, cfg: Config = CONFIG, scrape_reddit: bool = True,
     preflight = {p["proposal_id"]: broker.preflight(p.to_dict())
                  for _, p in proposals.iterrows()}
 
-    if auto_approve is None:
-        auto_approve = cfg.execution.auto_approve
     if not interactive and not auto_approve:
         print(engine.format_proposals(proposals))
         print("\n[non-interactive] no approval requested; nothing executed.")
         _finalize_equity(store, broker, scores, cfg, run_id)
         store.finish_run(run_id)
         summary = _cycle_summary(cfg, run_id, regime=regime, proposals=proposals,
-                                 executions=None, equity=live_equity)
+                                 executions=None, equity=live_equity,
+                                 halt=halt)
         _log_summary(summary)
         return {"run_id": run_id, "scores": scores, "proposals": proposals,
                 "executions": pd.DataFrame(), "stats": stats,
@@ -356,11 +390,16 @@ def run(store: Store, cfg: Config = CONFIG, scrape_reddit: bool = True,
 
     print("\n[execution]")
     executions = approval.execute_approved(reviewed, broker, store, run_id, cfg)
+    # Covers positions opened before protection was on, and the remainder of a
+    # partial exit (whose protection was cancelled to free the balance).
+    if may_execute:
+        reconcile.protect_open_positions(store, broker, cfg)
 
     _finalize_equity(store, broker, scores, cfg, run_id)
     store.finish_run(run_id)
     summary = _cycle_summary(cfg, run_id, regime=regime, proposals=reviewed,
-                             executions=executions, equity=live_equity)
+                             executions=executions, equity=live_equity,
+                             halt=halt)
     _log_summary(summary)
     return {"run_id": run_id, "scores": scores, "proposals": reviewed,
             "executions": executions, "stats": stats,

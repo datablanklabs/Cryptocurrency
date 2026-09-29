@@ -33,7 +33,7 @@ from typing import Any
 import pandas as pd
 
 from .config import CONFIG, Config
-from .store import Store, iso, utcnow
+from .store import Store, book_of, iso, utcnow
 
 # (key, config flag, human label) in precedence order.
 TRIGGERS = [
@@ -62,8 +62,14 @@ def _age_days(opened_at: str | None) -> float | None:
 def evaluate(store: Store, cfg: Config = CONFIG,
              holdings: dict[str, float] | None = None,
              scores: pd.DataFrame | None = None,
-             prices: dict[str, float] | None = None) -> pd.DataFrame:
+             prices: dict[str, float] | None = None,
+             book: str | None = None) -> pd.DataFrame:
     """Check every open position against the enabled triggers.
+
+    `book` ('paper' | 'binance') selects whose entry terms apply; it defaults
+    to the book of `cfg.execution.mode`. Holdings and terms must come from the
+    same book - a paper position judged on a live position's stop is wrong in
+    both directions.
 
     Returns one row per position that should be exited, with the trigger that
     fired, a human explanation, and how much to sell. Also refreshes each
@@ -80,7 +86,8 @@ def evaluate(store: Store, cfg: Config = CONFIG,
     if not ex.enabled or not holdings:
         return pd.DataFrame()
 
-    meta_df = store.position_meta()
+    book = book or book_of(cfg.execution.mode)
+    meta_df = store.position_meta(book=book)
     meta = {r["symbol"]: dict(r) for _, r in meta_df.iterrows()} if not meta_df.empty else {}
 
     score_map: dict[str, float] = {}
@@ -106,7 +113,7 @@ def evaluate(store: Store, cfg: Config = CONFIG,
         # from the entry, which is not a trailing stop.
         high_water = None
         if last and has_meta:
-            high_water = store.bump_high_water(symbol, last)
+            high_water = store.bump_high_water(symbol, last, book)
 
         entry = float(m.get("entry_price") or 0) or None
         stop = float(m.get("stop") or 0) or None

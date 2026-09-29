@@ -93,6 +93,12 @@ UNIVERSE: tuple[Asset, ...] = (
 
 ASSET_BY_SYMBOL: dict[str, Asset] = {a.symbol: a for a in UNIVERSE}
 
+# Cash-equivalents. Never scored: a stablecoin has no forward return to rank, so
+# one held in the account would only drag the cross-section's mean and take a
+# bottom slot in every IC / quantile-spread calculation.
+STABLECOINS: frozenset[str] = frozenset({"USDT", "USDC", "BUSD", "DAI", "TUSD", "FDUSD",
+                                         "PYUSD", "USD"})
+
 
 # --------------------------------------------------------------------------
 # Scheduled dated events (Feature 5)
@@ -394,6 +400,12 @@ class RiskConfig:
     # MIN_NOTIONAL on BTCUSDT is $1.00, but sub-$15 positions are mostly fees.
     min_notional_usd: float = 15.0
     max_proposals: int = 3
+    # Re-buying a name you already hold because it still ranks top is the
+    # biggest source of live turnover: 35 of the first 50 live buys were
+    # add-ons, each paying a fresh entry fee. Off by default - a held name
+    # keeps its position and the slot goes to the next candidate. When on,
+    # `max_position_pct` caps the WHOLE position (holding + add), not the add.
+    add_to_positions: bool = False
     # Minimum |composite| to be proposable in "absolute" selection mode. Raise
     # it to be pickier; set it to 0.0 to always surface a full slate. It is
     # deliberately not 0: on a genuinely directionless day the honest output is
@@ -406,6 +418,20 @@ class RiskConfig:
     # quoted notional, and sizing buys off an optimistic figure is how you end
     # up with a rejected final order.
     exit_proceeds_haircut_pct: float = 1.0
+
+    # ---- Loss halt ----------------------------------------------------------
+    # Blocks new BUYs (exits still run) once the book has lost too much, either
+    # from its equity peak or over a trailing window. `notify.drawdown_alert_pct`
+    # only tells you; this stops adding risk until you decide to resume.
+    # Resume by setting `halt_reset_after` to an ISO timestamp (e.g.
+    # "2026-10-01T00:00:00+00:00"): snapshots before it are ignored, so the peak
+    # and the window restart there. Do the same after a WITHDRAWAL - the equity
+    # curve can't tell taking money out from losing it. 0 disables a test.
+    halt_enabled: bool = True
+    halt_drawdown_pct: float = 15.0         # equity this far below its peak
+    halt_window_days: float = 7.0
+    halt_window_loss_pct: float = 8.0       # equity down this much over the window
+    halt_reset_after: str = ""
 
 
 @dataclass
@@ -887,8 +913,11 @@ class ExecutionConfig:
     # stop is always a stop-LIMIT: `stop_limit_offset_bps` sets how far through
     # the trigger the limit sits, since a limit exactly at the stop may not fill
     # in a fast move.
-    place_stop_orders: bool = False        # rest a protective stop after entry
-    place_limit_orders: bool = False       # rest a take-profit limit at the target
+    # On by default: with them off, a live position's stop only fires when
+    # someone runs a cycle. Paper mode records a simulated row and nothing
+    # else; validate-only records what would rest and sends nothing.
+    place_stop_orders: bool = True         # rest a protective stop after entry
+    place_limit_orders: bool = True        # rest a take-profit at the target (as one OCO)
     place_stop_limit_orders: bool = True   # stop leg uses STOP_LOSS_LIMIT (required here)
     stop_limit_offset_bps: float = 25.0
 
@@ -981,6 +1010,7 @@ class NotifyConfig:
     on_price_fallback: bool = True      # scoring fell through to the yfinance backstop
     on_drawdown: bool = True
     drawdown_alert_pct: float = 10.0    # alert when equity FIRST falls this far below its own peak
+    on_loss_halt: bool = True           # risk.halt_* tripped and new BUYs are now blocked
 
 
 @dataclass

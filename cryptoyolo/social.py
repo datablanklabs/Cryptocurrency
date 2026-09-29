@@ -367,6 +367,34 @@ class RedditClient:
                                       f"https://reddit.com{d.get('permalink','')}"))
         return rows
 
+    def archive(self, subreddit: str, kind: str, after: float, before: float,
+                limit: int = 100, newest_first: bool = False) -> list[dict] | None:
+        """One page of Arctic Shift history strictly between `after` and
+        `before` (epoch seconds), oldest first unless `newest_first`.
+        None = the request failed."""
+        endpoint = "posts" if kind == "post" else "comments"
+        payload = self._get(f"{self.ARCTIC}/{endpoint}/search",
+                            {"subreddit": subreddit, "after": int(after),
+                             "before": int(before), "limit": min(100, limit),
+                             "sort": "desc" if newest_first else "asc"})
+        if payload is None or "data" not in payload:
+            return None
+        rows = []
+        for d in payload["data"]:
+            pid = d.get("id", "")
+            if kind == "post":
+                rows.append(self._row(f"t3_{pid}", subreddit, "post", d.get("author"),
+                                      d.get("created_utc"), d.get("score"),
+                                      d.get("num_comments"), d.get("title"),
+                                      d.get("selftext"),
+                                      f"https://reddit.com{d.get('permalink', '')}"))
+            else:
+                rows.append(self._row(f"t1_{pid}", subreddit, "comment", d.get("author"),
+                                      d.get("created_utc"), d.get("score"), 0, "",
+                                      d.get("body"),
+                                      f"https://reddit.com{d.get('permalink', '')}"))
+        return rows
+
     # -- source: Reddit Atom feeds -----------------------------------------
     def _rss(self, subreddit: str, limit: int, kind: str) -> list[dict]:
         import xml.etree.ElementTree as ET
@@ -686,9 +714,19 @@ def scrape(store: Store, cfg: Config = CONFIG, verbose: bool = True) -> dict[str
               "Mention counts and sentiment are unaffected.")
 
     store.upsert_posts(all_rows)
+    mentions = mentions_for_rows(all_rows, patterns)
+    store.upsert_mentions(mentions)
+    if verbose:
+        print(f"  -> {len(all_rows)} items, {len(mentions)} symbol mentions stored "
+              f"[source: {client.mode}]")
+    return {"posts": len(all_rows), "mentions": len(mentions), "blocked": 0,
+            "source": client.mode, "degraded": list(client.degraded)}
 
+
+def mentions_for_rows(rows: list[dict], patterns: dict) -> list[dict]:
+    """Symbol mentions (with sentiment and engagement weight) in post rows."""
     mentions: list[dict] = []
-    for row in all_rows:
+    for row in rows:
         text = f"{row['title']}\n{row['body']}".strip()
         if not text:
             continue
@@ -712,13 +750,7 @@ def scrape(store: Store, cfg: Config = CONFIG, verbose: bool = True) -> dict[str
                 "weight": round((1.0 + engagement) * kind_w * rule_w, 4),
                 "matched_on": matched_on,
             })
-
-    store.upsert_mentions(mentions)
-    if verbose:
-        print(f"  -> {len(all_rows)} items, {len(mentions)} symbol mentions stored "
-              f"[source: {client.mode}]")
-    return {"posts": len(all_rows), "mentions": len(mentions), "blocked": 0,
-            "source": client.mode, "degraded": list(client.degraded)}
+    return mentions
 
 
 # --------------------------------------------------------------------------
@@ -736,13 +768,24 @@ def score_symbols(store: Store, cfg: Config = CONFIG) -> pd.DataFrame:
     """
     rc = cfg.reddit
     now = utcnow()
-    recent_start = now - timedelta(hours=rc.velocity_window_hours)
-    baseline_start = now - timedelta(days=rc.baseline_days)
-
-    hist = store.mentions_since(baseline_start)
+    hist = store.mentions_since(now - timedelta(days=rc.baseline_days))
     # Measure over the SAME window the baseline uses, or the two silently
     # disagree the moment baseline_days is changed from its default.
     span_hours = store.history_span_hours(within_days=rc.baseline_days)
+    return score_mentions(hist, span_hours, now, cfg)
+
+
+def score_mentions(hist: pd.DataFrame, span_hours: float, now: datetime,
+                   cfg: Config = CONFIG) -> pd.DataFrame:
+    """The scoring behind `score_symbols`, as of `now`, from a mentions frame.
+
+    `hist` holds the mentions inside the baseline window ending at `now` (with
+    a tz-aware `created_at`); `span_hours` is how much post history that window
+    actually covers. Split out so the backtest can score social point-in-time
+    from archived history exactly as a live run would have.
+    """
+    rc = cfg.reddit
+    recent_start = now - timedelta(hours=rc.velocity_window_hours)
 
     # Per-source mean tone across ALL assets in the window. Subtracting it makes
     # the score measure deviation from a platform's norm rather than its
