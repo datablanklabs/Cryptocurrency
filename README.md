@@ -112,6 +112,8 @@ build_notebook.py             the notebook's real source
 collect.py                    scheduled collector entry point (path-independent)
 run_cycle.py                  one trading cycle from the CLI (--auto-approve lives here)
 backfill_prices.py            one-off: fill prices_daily for the runs already logged
+backtest.py                   replay the price families over a year+ of history (CLI)
+backfill_social.py            pull a year of archived Reddit posts for the social backtest (CLI)
 com.crypto-yolo.collector.plist   launchd job, runs collect.py every 8h
 com.crypto-yolo.trader.plist      launchd job, runs one paper cycle a day
 cryptoyolo/
@@ -136,12 +138,19 @@ cryptoyolo/
   regime.py       BTC-trend regime gate: how much long exposure the tape justifies,
                   dampened (never boosted) by macro.py's read
   portfolio_risk.py  correlation matrix + sqrt(r' C r) heat of a candidate slate
+  loss_halt.py    blocks new BUYs after a drawdown / trailing-window loss
+  reconcile.py    live only: imports fills made at the exchange, keeps protection resting
   exits.py        five configurable exit triggers for open positions
   engine.py       scoring (6 families + xsec momentum), ranking, risk-based sizing
   broker.py       signed Binance REST client + paper broker + the fee/slippage model
   approval.py     per-trade approval gate
   pipeline.py     end-to-end orchestration (equity snapshot + structured summary per cycle)
   evaluation.py   the feedback loop: forward-return IC, realised trades, benchmark
+  backtest.py     point-in-time replay of technical / xsec / positioning (+ social
+                  from the backfill, + the regime gate) over cached history,
+                  with a net-of-fees top-N simulation
+  signals.py      candidate signals for the backtest's factor lab
+  social_backfill.py  Arctic Shift history into data/social_backfill.sqlite
   logsetup.py     rotating log file in data/ + stderr, for the unattended jobs
   notify.py       best-effort alerts (ntfy / webhook / macOS banner)
   scheduler.py    in-kernel collector thread (dies with the kernel)
@@ -512,13 +521,14 @@ Four behaviours worth knowing:
 
 Everything above runs **only when you run the notebook** — a stop breached at 3am
 is acted on at your next run. Closing that gap needs an order resting at the
-venue: `place_stop_orders` and `place_limit_orders` submit one after each entry
-fills.
+venue: `place_stop_orders` and `place_limit_orders` (both **on by default**)
+submit one OCO after each entry fills. In paper mode that is only a simulated
+row; in validate-only mode it is recorded and never sent.
 
 | Setting | Effect |
 |---|---|
-| `place_stop_orders` | rest a protective stop after entry |
-| `place_limit_orders` | rest a take-profit at the target |
+| `place_stop_orders` | rest a protective stop after entry (default on) |
+| `place_limit_orders` | rest a take-profit at the target (default on) |
 | `place_stop_limit_orders` | stop leg uses `STOP_LOSS_LIMIT` (required on Binance.US) |
 | `use_oco` | send both legs as one OCO so filling one cancels the other |
 | `stop_limit_offset_bps` | how far through the trigger the limit sits (default 25) |
@@ -542,6 +552,37 @@ Five things that shaped this implementation:
   *would* rest but place nothing — Binance has no test endpoint for OCO, so it
   cannot be dry-run validated at all. Binance also caps resting algo orders per
   symbol (`MAX_NUM_ALGO_ORDERS`, currently 5).
+- **One protective order per position.** Adding to a protected position cancels
+  its OCO and rests a new one sized to the whole holding.
+
+### Reconciliation — what happened at the exchange while nobody was looking
+
+A resting stop that fills overnight, or a trade you make by hand in the Binance
+app, never passes through this code, so the local order log can't know about
+it. Left alone, `realized_trades` would show that position open forever, and
+the next entry on the same symbol would inherit the old `position_meta` — its
+`opened_at` (an instant horizon exit) and its high-water mark (a trailing stop
+armed on the previous trade's peak).
+
+`cryptoyolo/reconcile.py` fixes that. At the start of every **live** cycle
+(`[reconcile]` in the output) it:
+
+1. asks Binance what became of each `resting` protective order and marks it
+   `filled` or `cancelled`;
+2. pulls `myTrades` for every pair this system has traded and imports each fill
+   no local order accounts for, as its own `orders` row (`order_type`
+   `PROTECTIVE` for an OCO/stop leg, `EXTERNAL` for anything else; `order_id`
+   `bnc-x-<exchange orderId>`, so re-running never duplicates). Fills from
+   before the pair was first traded here are left alone;
+3. clears `position_meta` for positions the exchange no longer holds;
+4. prints any symbol where the local log and the exchange balance disagree.
+
+At the end of a cycle that is allowed to execute (interactive, or auto-approve
+with every live switch set — never a propose-only run), every live position
+with recorded terms but no resting protection gets one: positions opened before
+protection was switched on, and the remainder of a partial exit. A position
+already through its stop or target is left to the exits pass. Paper and
+validate-only modes skip both steps; the local book is the only book there.
 
 ### Exits fund the entries
 
@@ -553,7 +594,11 @@ the execution-time cash check still blocks the buy it was funding.
 
 The trailing stop needs memory across runs, so each position carries a
 `position_meta` row (opened-at, stop, target, horizon, high-water mark) written
-on the entry fill and cleared when the position closes. Positions opened outside
+on the entry fill and cleared when the position closes. Rows are keyed by
+**(symbol, book)** — `paper` or `binance` — because the daily paper job and the
+live account can hold the same symbol at once; keyed by symbol alone, a paper
+fill overwrote a live position's stop and a paper exit deleted its terms.
+Validate-only orders write no terms (nothing filled). Positions opened outside
 this dashboard have no such row: only score-reversal can act on them, and both
 the exit reason and the Feature 0 table say so rather than inventing terms.
 
@@ -648,9 +693,38 @@ whole slate scales down, and the run prints the heat, the perfectly-correlated
 `gross`, and the `diversification_ratio` (heat / gross). Set
 `correlation_sizing = False` to fall back to the gross deployment cap only.
 
-Positions are capped per-trade (`max_position_pct`) and in aggregate
-(`max_total_deployed_pct × regime scale`); when a cap binds, buys scale down
-proportionally so the ranking is preserved.
+Positions are capped per-position (`max_position_pct`) and the slate in
+aggregate (`max_total_deployed_pct × regime scale`); when a cap binds, buys
+scale down proportionally so the ranking is preserved.
+
+**Held names aren't re-bought.** A name you already hold that still ranks top
+used to be bought again every cycle — 35 of the first 50 live buys were
+add-ons, each paying a fresh entry fee for exposure already on the book. With
+`risk.add_to_positions = False` (the default) it is skipped and its slot goes to
+the next candidate. Set it `True` to allow adds; `max_position_pct` then caps the
+whole position (holding + add), not just the new order.
+
+### Loss halt
+
+`cryptoyolo/loss_halt.py`. The drawdown *alert* (`notify.drawdown_alert_pct`)
+tells you the account is down; the halt stops the next cycle from buying anyway.
+Each cycle it reads the book's own equity snapshots plus this cycle's live
+equity and trips when either
+
+- equity is `risk.halt_drawdown_pct` (15%) below its peak, or
+- equity fell `risk.halt_window_loss_pct` (8%) over `risk.halt_window_days` (7).
+
+A tripped halt drops every new BUY (the empty-slate explanation says so); exits,
+stops and resting protection keep working. The verdict is logged per cycle
+(`halt_log`), the cycle summary carries `halted=`, and an alert fires on the
+transition into a halt (`notify.on_loss_halt`).
+
+It **does not lift by itself** — a book that has stopped buying can only recover
+through what it already holds, so "wait for the drawdown to heal" could mean
+never. Resuming is your call: set `risk.halt_reset_after` to an ISO timestamp
+and only snapshots after it count. Do the same after a **withdrawal**, which the
+equity curve cannot tell apart from a loss. `risk.halt_enabled = False` turns
+it off; a limit of 0 disables that test.
 
 ### Purchases never exceed available cash
 
@@ -719,7 +793,8 @@ evaluation.recommend_weights(report["forward_returns"])   # data-driven ScoreWei
 | `hit_rate` | share of bullish (bearish) calls that went up (down) |
 | `realized_trades` / `trade_stats` | FIFO round-trip reconstruction from the order log (realised fee from the `orders.fee_usd` column, then the response blob, then an estimate): win rate, avg win/loss, profit factor, **fee drag as % of gross P&L** |
 | `benchmark_returns` | buy-and-hold BTC and an equal-weight basket over the same window |
-| `equity_stats` | total return, annualised Sharpe, max drawdown of the equity curve, and the gap vs BTC — restricted to **one** snapshot mode (paper and live never share a curve) |
+| `equity_stats` / `equity_stats_by_mode` | total return, annualised Sharpe, max drawdown of the equity curve, and the gap vs BTC — **one curve per snapshot mode** (paper and live never share a curve; the summary prints every mode on record). The live curve counts deposits and withdrawals as returns |
+| `execution_quality` | engine-sent orders per side × type: fill rate, IOC limits that expired unfilled, slippage vs proposal entry, realised fee bps, and the forward return of missed vs filled entries (repeat attempts on one symbol-day = one setup) |
 | `regime_effectiveness` | realised forward return of the universe / top-N per recorded regime state — did `risk_off` runs actually precede weaker returns? |
 | `recommend_weights` | leads with **`blend_verdict`** (does the composite beat its own best single component?); then weights ∝ measured IC, zeroed for any family with \|t\| < 2, keeping the hand-set weights if fewer than two families clear |
 
@@ -735,6 +810,108 @@ Sharpe and benchmark numbers are the same each time you recompute them, and
 prices yet — run `./backfill_prices.py` once to fill them in
 (`./backfill_prices.py --status` shows coverage). If a symbol still has no local
 history the module falls back to a live fetch and stores the result.
+
+**Two things are left out of every report.** Stablecoins (`config.STABLECOINS`)
+are never scored — a held USDC balance used to be, and sat at the bottom of
+every cross-section. And when a SELL is rounded down to the exchange's lot step,
+the sliver it leaves (worth under `evaluation.DUST_USD`) is folded into the
+trade that closed instead of showing up as an extra open "trade".
+
+### Backtesting the price families — no waiting for live runs
+
+Live runs give you one cross-section a day, and overlapping 7-day windows make
+a month of them worth about four independent samples. But `technical`, `xsec`
+and `positioning` are pure functions of candles and funding, which the
+exchanges publish historically — so `backtest.py` replays them:
+
+```bash
+./backtest.py                  # sync the cache, replay 365 days, report
+./backtest.py --days 540 --hold 7 --csv data/bt.csv
+./backtest.py --no-sync        # offline, from the cache
+./backtest.py --no-sync --signals reversal_1d,mymod:my_signal   # test an idea
+```
+
+At each daily step (13:00 UTC) it rebuilds the three views the live engine sees
+— 1 day of 5m bars, 7 days of 1h, a year of 1d — from **bars that had closed by
+then**, scores them with the engine's own `technical_score` / `_xsec_momentum` /
+`positioning.score_rates`, and attaches realised forward returns. The frame has
+the same shape as `evaluation.forward_returns`, so every IC tool works on it.
+The report adds each family's IC in each half of the window (a real signal
+keeps its sign), top-N vs bottom-N spreads, the blend verdict, and a
+**top-N portfolio, rebalanced every `--hold` days, net of fees + slippage, vs
+BTC and an equal-weight basket**.
+
+Candles go into `data/backtest_cache.sqlite` (a year of 5m bars for the universe
+is ~100 MB), never the main database; later runs only fetch the new tail.
+
+**Piece by piece.** Each row also carries `technical_score`'s five parts
+unweighted (`tc_trend`, `tc_momentum`, `tc_position`, `tc_rsi`, `tc_volume`),
+and the report ICs each one — so when the blend is bad you can see which piece
+is dragging it.
+
+**Factor lab.** `cryptoyolo/signals.py` holds candidate signals: any
+`fn(ctx) -> float` reading only the bars in `ctx` (all closed by the step time),
+higher = expect better. Built-ins: `reversal_1d`, `reversal_3d`, `momentum_30d`,
+`low_vol`, `funding_level`; they run by default. Pass your own with `--signals
+mymodule:myfn` (or `label=mymodule:myfn`), and `backtest.simulate(fr,
+score_col="myfn")` trades one on its own. An idea gets a year of point-in-time
+IC here before it touches `engine.py`.
+
+**Regime gate, replayed.** `regime.classify` is the live gate's BTC-trend logic
+as a pure function; the replay records its verdict at every step, the report
+shows forward returns by state, and the portfolio is simulated with and without
+it (neutral = half weight, risk_off = cash). The Kalshi macro dampener has no
+history and isn't replayed.
+
+What the 2025-09-28 → 2026-09-27 replay said (one year, 20 assets — a single,
+mostly falling year, so treat every line as a lead, not a result):
+
+- `technical_raw`'s negative 1-day IC (t −3.2) comes from `tc_trend` (−3.2) and
+  `tc_position` (−2.9); the mean-reversion piece `tc_rsi` points the right way
+  (+3.2). Mostly first-half; the second half is near zero.
+- `low_vol` was the only candidate positive at every horizon and in both halves
+  (7d IC +0.15, t 3.1). In a down year "calm names lost less" is exactly what
+  that would look like, so it needs a rising year before it means anything.
+- The gate was risk_off on 286 of 358 days. Top-3 went from −58% to +6.8%
+  (max drawdown −79% → −36%, fee drag 29% → 6%) — mostly the value of sitting
+  in cash through the decline.
+- A rank buffer of 3 (keep a holding while it's in the top 6) cut turnover
+  1.20 → 0.74 per rebalance and fee drag 29% → 18% (−58% → −46%); with the
+  gate, +6.8% → +9.0%.
+
+**Rank buffer.** `simulate(buffer=k)` keeps a held name while it ranks within
+the top N+k and only re-fills freed slots; the report prints the top-N with
+and without it (`--buffer`, default `max_proposals`; 0 = off). There is no
+"expected edge must clear costs" gate: that needs a calibrated return forecast,
+and with every family's IC near zero the forecast is near zero — such a gate
+would just block everything. Revisit once something shows real IC.
+
+**Social, from archived Reddit.** Live collection only started in August, so
+the social family's IC rests on a handful of independent samples. Arctic Shift
+is an archive, so a year of it can be pulled after the fact:
+
+```bash
+./backfill_social.py                 # 365d of posts, every configured subreddit (~1h)
+./backfill_social.py --status        # what's held
+./backtest.py --no-sync              # uses data/social_backfill.sqlite if present
+```
+
+It writes a separate `data/social_backfill.sqlite` (never the main database —
+backfilled history would shift live velocity baselines), resumes where it
+stopped, and only ever fetches what the file doesn't hold. The replay then
+scores `social` at each step with the live scoring function
+(`social.score_mentions`) from mentions created before that step, and adds
+`composite_social` (price + social at their configured relative weights).
+Three limits: it is **Reddit only** (no StockTwits / Mastodon / 4chan archive);
+**posts only** unless you pass `--comments` (~10× the requests; live reads
+comments too); and vote scores are the archived final ones, so the engagement
+weighting has a little lookahead — mention counts, authors and tone don't.
+
+What it can't tell you: `catalyst` has no point-in-time history, so the main
+`composite` here is **price-only** (technical + positioning at their
+configured relative weights). The universe is today's list, so dead coins are
+missing (survivorship flatters long-only results). And OKX serves only ~3 months
+of funding, so `positioning` is NaN before that.
 
 ---
 
@@ -906,7 +1083,7 @@ line. `CONFIG.notify.enabled = False` turns it all off.
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                          # ~84 tests, no network, throwaway SQLite
+pytest                          # ~200 tests, no network, throwaway SQLite
 python3 build_notebook.py       # regenerate the (gitignored) notebook
 ```
 

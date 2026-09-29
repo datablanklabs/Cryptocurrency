@@ -184,6 +184,7 @@ CONFIG.risk.max_total_deployed_pct = 60.0     # cap across all proposals (× reg
 CONFIG.risk.reward_risk_target    = 2.0        # target = 2R (net of fees if fee_adjust_targets)
 CONFIG.risk.fee_adjust_targets    = True       # widen the target so NET R:R = 2
 CONFIG.risk.max_proposals         = 3
+CONFIG.risk.add_to_positions      = False      # don't re-buy a held name that still ranks top
 
 # Stop distance vs the HOLDING horizon. "horizon" scales 1.5×daily-ATR by
 # sqrt(stop_horizon_days) so a multi-week thesis isn't stopped by one day's
@@ -211,6 +212,16 @@ CONFIG.risk.trim_threshold        = 0.10         # trim a holding only once this
 CONFIG.risk.correlation_sizing    = True
 CONFIG.risk.max_portfolio_heat_pct = 2.5
 CONFIG.risk.corr_lookback_days    = 60
+
+# Loss halt. Blocks new BUYs (exits still run) once equity is this far below
+# its peak, or down this much over the trailing window. It does not lift by
+# itself: set halt_reset_after to an ISO timestamp to resume (also after a
+# withdrawal, which the equity curve can't tell from a loss).
+CONFIG.risk.halt_enabled          = True
+CONFIG.risk.halt_drawdown_pct     = 15.0
+CONFIG.risk.halt_window_days      = 7.0
+CONFIG.risk.halt_window_loss_pct  = 8.0
+CONFIG.risk.halt_reset_after      = ""           # e.g. "2026-10-01T00:00:00+00:00"
 
 # ── Fees & slippage (the return you give away on every trade) ───────────
 # Binance.US base tier is ~40 bps taker/maker — a ~0.8% round trip. Enable the
@@ -345,8 +356,8 @@ CONFIG.execution.max_entry_slippage_bps = 60.0
 # an overnight stop breach gets acted on at the time it happens.
 # Binance.US supports STOP_LOSS_LIMIT and TAKE_PROFIT_LIMIT but NOT market
 # STOP_LOSS, so a protective stop is always a stop-LIMIT.
-CONFIG.execution.place_stop_orders       = False   # rest a protective stop after entry
-CONFIG.execution.place_limit_orders      = False   # rest a take-profit at the target
+CONFIG.execution.place_stop_orders       = True    # rest a protective stop after entry
+CONFIG.execution.place_limit_orders      = True    # rest a take-profit at the target
 CONFIG.execution.place_stop_limit_orders = True    # stop leg is STOP_LOSS_LIMIT (required)
 CONFIG.execution.use_oco                 = True    # send both as one OCO (see below)
 CONFIG.execution.stop_limit_offset_bps   = 25.0    # limit sits this far through the trigger
