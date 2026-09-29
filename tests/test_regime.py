@@ -136,3 +136,13 @@ def test_macro_disabled_via_config_is_ignored_even_with_a_store(monkeypatch):
     assert v["state"] == "risk_on"
     assert v["exposure_scale"] == 1.0
     assert v["macro_score"] is None
+
+
+def test_classify_is_the_pure_trend_verdict(cfg, make_series):
+    rc = cfg.regime
+    up = regime.classify(make_series(np.linspace(100, 200, 300)), rc)
+    assert (up["state"], up["exposure_scale"], up["abstain"]) == ("risk_on", 1.0, None)
+    down = regime.classify(make_series(np.linspace(200, 100, 300)), rc)
+    assert down["state"] == "risk_off"
+    short = regime.classify(make_series(np.linspace(100, 200, 20)), rc)
+    assert short["state"] == "neutral" and "min_candles" in short["abstain"]

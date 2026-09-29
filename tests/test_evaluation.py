@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import uuid
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -68,6 +69,32 @@ def test_realized_trades_simple_round_trip_net_of_fees(store, cfg):
     stats = evaluation.trade_stats(trades)
     assert set(stats["book"]) == {"all", "paper"}
     assert stats.loc[stats["book"] == "all", "net_pnl"].iloc[0] == pytest.approx(191.2)
+
+
+def test_realized_trades_folds_sell_rounding_dust_into_the_closed_trade(store, cfg, monkeypatch):
+    """A SELL rounded down to the lot step leaves ~$0.02 behind. That sliver is
+    not a second (open, "winning") trade; its entry fee belongs to the exit."""
+    def _no_open_lots(*a, **k):
+        raise AssertionError("dust must not be marked to market as an open lot")
+    monkeypatch.setattr("cryptoyolo.prices.latest_prices", _no_open_lots)
+    _order(store, side="BUY", qty=130.18, price=0.83, fee=0.45,
+           ts="2026-01-01T00:00:00+00:00", mode="binance-live")
+    _order(store, side="SELL", qty=130.15, price=0.82, fee=0.45,
+           ts="2026-01-05T00:00:00+00:00", mode="binance-live")
+    trades = evaluation.realized_trades(store, cfg)
+    assert len(trades) == 1
+    t = trades.iloc[0]
+    assert t["fees"] == pytest.approx(0.90)          # the whole entry fee, not 99.98% of it
+    assert t["net_pnl"] == pytest.approx(130.15 * (0.82 - 0.83) - 0.90)
+
+
+def test_realized_trades_keeps_a_real_remainder_open(store, cfg, monkeypatch):
+    monkeypatch.setattr("cryptoyolo.prices.latest_prices", lambda syms, c: {"AAA": 1.0})
+    _order(store, side="BUY", qty=100, price=1.0, fee=0.4, ts="2026-01-01T00:00:00+00:00")
+    _order(store, side="SELL", qty=90, price=1.1, fee=0.4, ts="2026-01-05T00:00:00+00:00")
+    trades = evaluation.realized_trades(store, cfg)
+    assert len(trades) == 2                           # $10 left is a position, not dust
+    assert trades["close_ts"].isna().sum() == 1
 
 
 def test_realized_trades_fifo_partial_and_live_bucket(store, cfg, monkeypatch):
@@ -150,6 +177,25 @@ def test_forward_returns_reads_stored_prices_and_never_hits_the_network(
     assert (fr["fwd_7d"] > 0).all()        # a rising ramp -> positive forward return
 
 
+def test_forward_returns_drops_stablecoins(store, cfg, make_series, monkeypatch):
+    """Held USDC used to be scored; it has no return to rank."""
+    from datetime import datetime, timezone
+    monkeypatch.setattr("cryptoyolo.store.utcnow",
+                        lambda: datetime(2027, 7, 1, tzinfo=timezone.utc))
+    store.upsert_daily_prices_from_series(
+        "BTC", make_series([100.0 + i for i in range(400)], start="2026-05-01"), "test")
+    monkeypatch.undo()
+    monkeypatch.setattr("cryptoyolo.prices.get_ohlcv",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no network")))
+    run_id = "20260830T120000-t"
+    store.start_run(run_id, "paper")
+    base = {"technical": 0.0, "social": 0.0, "catalyst": 0.0, "composite": 0.0,
+            "positioning": 0.0, "events": 0.0, "xsec": 0.0, "components": {}}
+    store.save_scores(run_id, [{**base, "symbol": "BTC"}, {**base, "symbol": "USDC"}])
+    fr = evaluation.forward_returns(store, cfg, horizons=(1,))
+    assert list(fr["symbol"]) == ["BTC"]
+
+
 def test_price_series_does_not_alias_across_different_stores(tmp_path, cfg, make_series):
     """Regression guard: the cache used to key on `store is not None` (a bool),
     so two different Store instances for the same symbol/timeframe collided on
@@ -164,3 +210,77 @@ def test_price_series_does_not_alias_across_different_stores(tmp_path, cfg, make
     p2 = evaluation.price_series("BTC", cfg, store=s2)
     assert p1.iloc[-1] == pytest.approx(100.0)
     assert p2.iloc[-1] == pytest.approx(200.0)          # not aliased to s1's series
+
+
+# -- execution quality -----------------------------------------------------------
+def _xq_order(store, oid, ts, side, otype, status, price, entry, symbol="AAA", qty=1.0,
+           fee=None, mode="binance-live"):
+    store.save_proposals([{"proposal_id": f"p-{oid}", "run_id": "r", "ts": ts,
+                           "symbol": symbol, "side": side, "rank": 1, "composite": 0.1,
+                           "entry": entry, "stop": entry * 0.9, "target": entry * 1.2,
+                           "qty": qty, "notional": qty * entry, "horizon": "",
+                           "rationale": "", "payload": "{}", "decision": "approved"}])
+    store.save_order({"order_id": oid, "proposal_id": f"p-{oid}", "run_id": "r", "ts": ts,
+                      "venue": "binance-us", "mode": mode, "symbol": symbol, "side": side,
+                      "order_type": otype, "qty": qty, "price": price, "status": status,
+                      "exchange_ref": oid, "fee_usd": fee, "response": "{}"})
+
+
+def test_execution_quality_counts_fill_rates_and_signs_slippage(store, cfg):
+    _xq_order(store, "b1", "2026-01-02T12:00:00+00:00", "BUY", "LIMIT", "FILLED", 101.0, 100.0,
+           fee=0.404)
+    _xq_order(store, "b2", "2026-01-02T12:01:00+00:00", "BUY", "LIMIT", "EXPIRED_NO_FILL", 0.0, 100.0)
+    _xq_order(store, "b3", "2026-01-02T12:02:00+00:00", "BUY", "LIMIT", "REJECTED_SLIPPAGE", 0.0, 100.0)
+    _xq_order(store, "s1", "2026-01-05T12:00:00+00:00", "SELL", "MARKET", "FILLED", 99.0, 100.0)
+    _xq_order(store, "x1", "2026-01-06T12:00:00+00:00", "BUY", "LIMIT", "FILLED", 1.0, 1.0,
+           mode="paper")                                          # another book
+    store.save_order({"order_id": "bnc-x-9", "proposal_id": None, "run_id": "reconcile",
+                      "ts": "2026-01-07T00:00:00+00:00", "venue": "binance-us",
+                      "mode": "binance-live", "symbol": "AAA", "side": "SELL",
+                      "order_type": "PROTECTIVE", "qty": 1.0, "price": 90.0,
+                      "status": "FILLED", "exchange_ref": "9", "response": "{}"})
+
+    xq = evaluation.execution_quality(store, cfg)
+    bt = xq["by_type"].set_index(["side", "order_type"])
+    lim = bt.loc[("BUY", "LIMIT")]
+    assert (lim["sent"], lim["filled"], lim["expired_no_fill"], lim["refused_guard"]) == (2, 1, 1, 1)
+    assert lim["fill_rate_%"] == 50.0
+    assert ("SELL", "PROTECTIVE") not in bt.index                 # imported, not ours
+    sl = xq["slippage"].set_index(["side", "order_type"])
+    assert sl.loc[("BUY", "LIMIT"), "slip_mean_bps"] == pytest.approx(100.0)   # paid 1% up
+    assert sl.loc[("SELL", "MARKET"), "slip_mean_bps"] == pytest.approx(100.0) # sold 1% down
+    assert sl.loc[("BUY", "LIMIT"), "fee_mean_bps"] == pytest.approx(40.0)
+
+
+def test_missed_entries_are_compared_to_filled_ones_per_setup(store, cfg, make_series):
+    store.upsert_daily_prices_from_series("AAA", make_series(np.full(40, 100.0), "2026-01-01"), "t")
+    run = np.concatenate([np.full(5, 100.0), np.full(35, 150.0)])        # BBB takes off
+    store.upsert_daily_prices_from_series("BBB", make_series(run, "2026-01-01"), "t")
+    _xq_order(store, "f1", "2026-01-02T12:00:00+00:00", "BUY", "LIMIT", "FILLED", 100.0, 100.0)
+    for i in range(3):                                   # three retries, one setup
+        _xq_order(store, f"m{i}", f"2026-01-02T12:0{i}:00+00:00", "BUY", "LIMIT",
+               "EXPIRED_NO_FILL", 0.0, 100.0, symbol="BBB")
+    mvf = evaluation.execution_quality(store, cfg)["missed_vs_filled"].set_index("outcome")
+    assert (mvf.loc["missed", "attempts"], mvf.loc["missed", "setups"]) == (3, 1)
+    assert mvf.loc["missed", "mean_7d_%"] == pytest.approx(50.0)
+    assert mvf.loc["filled", "mean_7d_%"] == pytest.approx(0.0)
+
+
+def test_execution_quality_is_empty_without_live_orders(store, cfg):
+    assert evaluation.execution_quality(store, cfg) == {}
+
+
+def test_equity_stats_by_mode_reports_every_book_separately(store, cfg, monkeypatch):
+    monkeypatch.setattr(evaluation, "benchmark_returns", lambda *a, **k: {})
+    with store.conn() as con:
+        for i, (mode, eq) in enumerate([("paper", 10_000.0), ("paper", 10_100.0),
+                                        ("binance", 500.0), ("binance", 450.0),
+                                        ("binance", 480.0)]):
+            con.execute("INSERT INTO equity_snapshots (run_id, ts, mode, cash, "
+                        "positions_value, equity) VALUES (?,?,?,?,?,?)",
+                        (f"r{i}", f"2026-01-0{i + 1}T00:00:00+00:00", mode, eq, 0.0, eq))
+    by_mode = evaluation.equity_stats_by_mode(store, cfg)
+    assert set(by_mode) == {"paper", "binance"}
+    assert by_mode["paper"]["total_return_%"] == 1.0
+    assert by_mode["binance"]["total_return_%"] == -4.0
+    assert by_mode["binance"]["max_drawdown_%"] == -10.0

@@ -71,9 +71,9 @@ def test_high_water_only_ratchets_up(store: Store):
         "stop": 90.0, "target": 130.0, "horizon_days": 30.0,
         "high_water": 100.0, "proposal_id": "p", "mode": "paper",
     })
-    assert store.bump_high_water("SOL", 115.0) == 115.0
-    assert store.bump_high_water("SOL", 108.0) == 115.0        # a dip never lowers it
-    assert store.bump_high_water("SOL", 120.0) == 120.0
+    assert store.bump_high_water("SOL", 115.0, "paper") == 115.0
+    assert store.bump_high_water("SOL", 108.0, "paper") == 115.0        # a dip never lowers it
+    assert store.bump_high_water("SOL", 120.0, "paper") == 120.0
 
 
 def test_macro_markets_latest_is_newest_row_per_ticker(store: Store):
@@ -157,3 +157,52 @@ def test_prices_daily_replaces_only_provisional_rows(store: Store):
     ])
     got = store.daily_prices("BTC")
     assert list(got["close"]) == [99.0, 2.0]
+
+
+# -- position_meta is per book ------------------------------------------------
+def _meta(symbol, mode, entry, stop):
+    return {"symbol": symbol, "opened_at": iso(), "entry_price": entry, "stop": stop,
+            "target": entry * 1.3, "horizon_days": 30.0, "high_water": entry,
+            "proposal_id": f"p-{mode}", "mode": mode}
+
+
+def test_paper_and_live_terms_for_one_symbol_never_touch(store: Store):
+    store.upsert_position_meta(_meta("SOL", "binance-live", 117.0, 92.0))
+    store.upsert_position_meta(_meta("SOL", "paper", 120.0, 96.0))       # daily paper job
+    live = store.position_meta("SOL", book="binance").iloc[0]
+    assert (live["entry_price"], live["stop"]) == (117.0, 92.0)
+    store.bump_high_water("SOL", 150.0, "paper")
+    store.delete_position_meta("SOL", "paper")                            # paper exit
+    live = store.position_meta("SOL", book="binance").iloc[0]
+    assert (live["entry_price"], live["high_water"]) == (117.0, 117.0)
+    assert store.position_meta("SOL", book="paper").empty
+
+
+def test_validate_only_and_live_share_the_binance_book():
+    from cryptoyolo.store import book_of
+    assert [book_of(m) for m in ("paper", "binance", "binance-live", "binance-test", None)] \
+        == ["paper", "binance", "binance", "binance", "paper"]
+
+
+def test_legacy_symbol_keyed_table_migrates_to_per_book(tmp_path):
+    import sqlite3
+    db = tmp_path / "old.sqlite"
+    con = sqlite3.connect(db)
+    con.executescript("""
+        CREATE TABLE position_meta (symbol TEXT PRIMARY KEY, opened_at TEXT NOT NULL,
+            entry_price REAL, stop REAL, target REAL, horizon_days REAL,
+            high_water REAL, proposal_id TEXT, mode TEXT, updated_at TEXT);
+        INSERT INTO position_meta VALUES ('SOL','t',117,92,170,30,123,'p1','binance-live','u');
+        INSERT INTO position_meta VALUES ('XRP','t',1.36,1.02,2.07,30,1.59,'p2','paper','u');
+        INSERT INTO position_meta VALUES ('AVAX','t',10.6,8.07,16.1,30,10.6,'p3','binance-test','u');
+    """)
+    con.close()
+    s = Store(db)
+    pm = s.position_meta().set_index("symbol")
+    assert pm.loc["SOL", "book"] == "binance" and pm.loc["SOL", "high_water"] == 123
+    assert pm.loc["XRP", "book"] == "paper"
+    assert pm.loc["AVAX", "book"] == "binance"
+    s.upsert_position_meta(_meta("SOL", "paper", 120.0, 96.0))       # now coexists
+    assert len(s.position_meta("SOL")) == 2
+    Store(db)                                                          # idempotent
+    assert len(s.position_meta()) == 4

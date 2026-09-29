@@ -124,3 +124,39 @@ def test_propose_empty_when_nothing_clears_the_floor(store):
                            holdings={}, cash_available=None)
     assert props.empty
     assert "skipped" in props.attrs
+
+
+# -- turnover: held names ------------------------------------------------------
+def _ranked(*rows):
+    import pandas as pd
+    return pd.DataFrame([_scores_row(**r) for r in rows])
+
+
+def test_a_held_name_is_not_rebought_and_its_slot_goes_to_the_next(store):
+    cfg = _sizing_cfg()
+    cfg.risk.max_proposals = 1
+    scores = _ranked({"symbol": "AAA", "composite": 0.6}, {"symbol": "BBB", "composite": 0.4})
+    props = engine.propose(scores, store, "r5", cfg, holdings={"AAA": 5.0},
+                           cash_available=None)
+    assert props["symbol"].tolist() == ["BBB"]
+    empty = engine.propose(scores.iloc[:1], store, "r6", cfg, holdings={"AAA": 5.0},
+                           cash_available=None)
+    assert empty.attrs["skipped"]["already_held"] == 1
+    assert "already held" in engine.format_proposals(empty)
+
+
+def test_dust_holdings_do_not_count_as_held(store):
+    cfg = _sizing_cfg()
+    props = engine.propose(_one_row_frame(), store, "r7", cfg,
+                           holdings={"AAA": 0.01}, cash_available=None)   # $1 of AAA
+    assert props["symbol"].tolist() == ["AAA"]
+
+
+def test_when_adding_is_allowed_the_cap_covers_the_whole_position(store):
+    cfg = _sizing_cfg()
+    cfg.risk.add_to_positions = True
+    cfg.risk.max_position_pct = 20.0          # $2,000 of a $10,000 basis
+    # held: 15 x $100 = $1,500 -> the add may only be $500
+    props = engine.propose(_one_row_frame(atr_pct_daily=0.01), store, "r8", cfg,
+                           holdings={"AAA": 15.0}, cash_available=None)
+    assert props.iloc[0]["notional"] == pytest.approx(500.0, abs=0.01)
